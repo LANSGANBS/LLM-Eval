@@ -31,7 +31,13 @@ from llm_eval_system.spider.crawler import get_latest_models, get_simulated_data
 from llm_eval_system.utils.file_handler import FileHandler
 from llm_eval_system.utils.thread_manager import ThreadManager
 from llm_eval_system.utils.exceptions import handle_exception
-from llm_eval_system.ui.components import StyledButton, SidebarButton, LoadingSpinner, ToastNotification
+from llm_eval_system.ui.components import (
+    StyledButton,
+    SidebarButton,
+    LoadingSpinner,
+    ToastNotification,
+    RoundedCard,
+)
 from llm_eval_system.ui.icons import get_icon
 
 # Reduce logging - only errors by default for the desktop app.
@@ -97,6 +103,14 @@ class ModernApp:
         self._global_rank_map = {}
         self._is_loading = False
         self._photo_refs = []  # Keep references to PhotoImage objects
+        self._card_refs = []
+        self._ranking_row_map = {}
+        self._compare_dim_vars = {}
+        self._compare_rendering = False
+        self.sidebar_outer = None
+        self.content_outer = None
+        self._content_canvas = None
+        self._content_window = None
 
         self.db = DatabaseManager()
         self.file_handler = FileHandler()
@@ -129,13 +143,59 @@ class ModernApp:
                   background=[('selected', THEME['primary_light'])],
                   foreground=[('selected', THEME['primary'])])
 
-        style.configure('TScrollbar',
-                        background=THEME['bg_tertiary'],
-                        troughcolor=THEME['bg_secondary'])
+        style.configure('Modern.Vertical.TScrollbar',
+                background=THEME['primary_light'],
+                troughcolor=THEME['bg_tertiary'],
+                bordercolor=THEME['bg_tertiary'],
+                darkcolor=THEME['primary_light'],
+                lightcolor=THEME['primary_light'],
+                arrowcolor=THEME['text_muted'],
+                arrowsize=12,
+                gripcount=0,
+                width=12)
+        style.map('Modern.Vertical.TScrollbar',
+              background=[('active', THEME['primary'])],
+              arrowcolor=[('active', THEME['text_white'])])
 
-        style.configure('TCombobox',
-                        fieldbackground=THEME['bg_secondary'],
-                        background=THEME['bg_secondary'])
+        style.configure('Modern.TCombobox',
+                foreground=THEME['text'],
+                fieldbackground=THEME['bg_secondary'],
+                background=THEME['bg_secondary'],
+                bordercolor=THEME['border'],
+                lightcolor=THEME['border'],
+                darkcolor=THEME['border'],
+                arrowcolor=THEME['text_secondary'],
+                relief='flat',
+                borderwidth=1,
+                padding=(10, 7, 34, 7),
+                insertcolor=THEME['primary'])
+        style.map('Modern.TCombobox',
+              fieldbackground=[('readonly', THEME['bg_secondary'])],
+              selectbackground=[('readonly', THEME['primary_light'])],
+              selectforeground=[('readonly', THEME['text'])],
+              bordercolor=[('focus', THEME['border_focus'])],
+              lightcolor=[('focus', THEME['border_focus'])],
+              darkcolor=[('focus', THEME['border_focus'])])
+
+        style.configure('Modern.TEntry',
+                foreground=THEME['text'],
+                fieldbackground=THEME['bg_tertiary'],
+                background=THEME['bg_tertiary'],
+                bordercolor=THEME['border'],
+                lightcolor=THEME['border'],
+                darkcolor=THEME['border'],
+                relief='flat',
+                borderwidth=0,
+                padding=(6, 7))
+        style.map('Modern.TEntry',
+              bordercolor=[('focus', THEME['border_focus'])],
+              lightcolor=[('focus', THEME['border_focus'])],
+              darkcolor=[('focus', THEME['border_focus'])])
+
+        self.root.option_add('*TCombobox*Listbox.background', THEME['bg_secondary'])
+        self.root.option_add('*TCombobox*Listbox.foreground', THEME['text'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', THEME['primary_light'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', THEME['text'])
 
     def _build_ui(self):
         self._build_header()
@@ -143,17 +203,18 @@ class ModernApp:
         main_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 24))
 
         # Sidebar with scrollbar support
-        sidebar_outer = tk.Frame(main_frame, bg=THEME['bg_secondary'],
-                                  highlightbackground=THEME['border'],
-                                  highlightthickness=1, width=300)
-        sidebar_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
-        sidebar_outer.pack_propagate(False)
+        self.sidebar_outer = tk.Frame(main_frame, bg=THEME['bg_secondary'],
+                          highlightbackground=THEME['border'],
+                          highlightthickness=1, width=300)
+        self.sidebar_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
+        self.sidebar_outer.pack_propagate(False)
 
         # Canvas + scrollbar for sidebar scrolling
-        self._sidebar_canvas = tk.Canvas(sidebar_outer, bg=THEME['bg_secondary'],
+        self._sidebar_canvas = tk.Canvas(self.sidebar_outer, bg=THEME['bg_secondary'],
                                           highlightthickness=0, width=280)
-        sidebar_scroll = ttk.Scrollbar(sidebar_outer, orient=tk.VERTICAL,
-                                        command=self._sidebar_canvas.yview)
+        sidebar_scroll = ttk.Scrollbar(self.sidebar_outer, orient=tk.VERTICAL,
+                        style='Modern.Vertical.TScrollbar',
+                        command=self._sidebar_canvas.yview)
         self._sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
 
         sidebar_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -171,16 +232,9 @@ class ModernApp:
                                   lambda e: self._sidebar_canvas.itemconfig(
                                       self._sidebar_window, width=e.width))
 
-        # Mouse wheel scrolling for sidebar
-        def _on_sidebar_mousewheel(event):
-            delta = event.delta
-            if delta == 0 and getattr(event, 'num', None) in (4, 5):
-                delta = 120 if event.num == 4 else -120
-            self._sidebar_canvas.yview_scroll(int(-1 * (delta / 120)), 'units')
-            return 'break'
-
-        self._bind_mousewheel_recursive(self._sidebar_canvas, _on_sidebar_mousewheel)
-        self._bind_mousewheel_recursive(self.sidebar, _on_sidebar_mousewheel)
+        self.root.bind_all('<MouseWheel>', self._handle_sidebar_mousewheel, add='+')
+        self.root.bind_all('<Button-4>', self._handle_sidebar_mousewheel, add='+')
+        self.root.bind_all('<Button-5>', self._handle_sidebar_mousewheel, add='+')
 
         self._build_sidebar()
 
@@ -301,17 +355,117 @@ class ModernApp:
         # Ensure sidebar has enough space for scrolling
         self.sidebar.update_idletasks()
 
-    def _bind_mousewheel_recursive(self, widget, handler):
-        widget.bind('<MouseWheel>', handler, add='+')
-        widget.bind('<Button-4>', handler, add='+')
-        widget.bind('<Button-5>', handler, add='+')
-        for child in widget.winfo_children():
-            self._bind_mousewheel_recursive(child, handler)
+    def _widget_contains_point(self, widget, x_root, y_root):
+        if not widget or not widget.winfo_exists():
+            return False
+        left = widget.winfo_rootx()
+        top = widget.winfo_rooty()
+        right = left + widget.winfo_width()
+        bottom = top + widget.winfo_height()
+        return left <= x_root <= right and top <= y_root <= bottom
+
+    def _normalize_scroll_units(self, event):
+        delta = getattr(event, 'delta', 0)
+        if delta == 0 and getattr(event, 'num', None) in (4, 5):
+            return -1 if event.num == 4 else 1
+        if delta == 0:
+            return 0
+        if abs(delta) < 120:
+            return -1 if delta > 0 else 1
+        return int(-1 * (delta / 120))
+
+    def _handle_sidebar_mousewheel(self, event):
+        if not self._sidebar_canvas or not self._sidebar_canvas.winfo_exists():
+            return None
+
+        x_root = getattr(event, 'x_root', self.root.winfo_pointerx())
+        y_root = getattr(event, 'y_root', self.root.winfo_pointery())
+        if not self._widget_contains_point(self.sidebar_outer, x_root, y_root):
+            return None
+
+        units = self._normalize_scroll_units(event)
+        if units == 0:
+            return None
+
+        self._sidebar_canvas.yview_scroll(units, 'units')
+        return 'break'
+
+    def _content_can_scroll(self):
+        if not self._content_canvas or not self._content_canvas.winfo_exists():
+            return False
+        bbox = self._content_canvas.bbox('all')
+        if not bbox:
+            return False
+        return (bbox[3] - bbox[1]) > self._content_canvas.winfo_height() + 2
+
+    def _widget_has_scroll_owner(self, widget):
+        current = widget
+        while current is not None:
+            if current.winfo_class() in {'Treeview', 'TCombobox', 'Scrollbar'}:
+                return True
+            current = current.master
+        return False
+
+    def _handle_content_mousewheel(self, event):
+        if not self._content_canvas or not self._content_canvas.winfo_exists():
+            return None
+
+        x_root = getattr(event, 'x_root', self.root.winfo_pointerx())
+        y_root = getattr(event, 'y_root', self.root.winfo_pointery())
+        if self._widget_contains_point(self.sidebar_outer, x_root, y_root):
+            return None
+        if not self._widget_contains_point(self.content_outer, x_root, y_root):
+            return None
+        if not self._content_can_scroll():
+            return None
+
+        hovered = self.root.winfo_containing(x_root, y_root)
+        if hovered is not None and self._widget_has_scroll_owner(hovered):
+            return None
+
+        units = self._normalize_scroll_units(event)
+        if units == 0:
+            return None
+
+        self._content_canvas.yview_scroll(units, 'units')
+        return 'break'
+
+    def _create_card(self, parent, padding=(18, 16), min_height=None):
+        card = RoundedCard(parent, padding=padding, min_height=min_height)
+        self._card_refs.append(card)
+        return card
 
     def _build_content(self):
         """构建内容区域"""
-        self.content_container = tk.Frame(self.content, bg=THEME['bg'])
-        self.content_container.pack(fill=tk.BOTH, expand=True)
+        self.content_outer = tk.Frame(self.content, bg=THEME['bg'])
+        self.content_outer.pack(fill=tk.BOTH, expand=True)
+
+        self._content_canvas = tk.Canvas(self.content_outer, bg=THEME['bg'], highlightthickness=0)
+        content_scroll = ttk.Scrollbar(self.content_outer, orient=tk.VERTICAL,
+                                       style='Modern.Vertical.TScrollbar',
+                                       command=self._content_canvas.yview)
+        self._content_canvas.configure(yscrollcommand=content_scroll.set)
+
+        content_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.content_container = tk.Frame(self._content_canvas, bg=THEME['bg'])
+        self._content_window = self._content_canvas.create_window(
+            (0, 0), window=self.content_container, anchor='nw')
+
+        self.content_container.bind(
+            '<Configure>',
+            lambda e: self._content_canvas.configure(scrollregion=self._content_canvas.bbox('all'))
+        )
+        self._content_canvas.bind(
+            '<Configure>',
+            lambda e: self._content_canvas.itemconfig(self._content_window, width=e.width)
+        )
+
+        self.root.bind_all('<MouseWheel>', self._handle_content_mousewheel, add='+')
+        self.root.bind_all('<Button-4>', self._handle_content_mousewheel, add='+')
+        self.root.bind_all('<Button-5>', self._handle_content_mousewheel, add='+')
+
         self._show_ranking()
 
     # ==================== Tab switching ====================
@@ -322,6 +476,8 @@ class ModernApp:
             btn.set_active(tid == tab_id)
         for widget in self.content_container.winfo_children():
             widget.destroy()
+        self._card_refs = []
+        self._ranking_row_map = {}
 
         tab_map = {
             'ranking': self._show_ranking,
@@ -330,6 +486,8 @@ class ModernApp:
             'heatmap': self._show_heatmap,
         }
         tab_map.get(tab_id, self._show_ranking)()
+        if self._content_canvas and self._content_canvas.winfo_exists():
+            self.root.after_idle(lambda: self._content_canvas.yview_moveto(0))
 
     # ==================== Data loading ====================
 
@@ -447,45 +605,94 @@ class ModernApp:
     # ==================== Ranking Tab ====================
 
     def _show_ranking(self):
-        # Search bar
-        search_frame = tk.Frame(self.content_container, bg=THEME['bg'])
-        search_frame.pack(fill=tk.X, pady=(0, 16))
+        controls_card = self._create_card(self.content_container, padding=(20, 18))
+        controls_card.pack(fill=tk.X, pady=(0, 16))
+        controls = controls_card.content
+
+        title_row = tk.Frame(controls, bg=THEME['bg_secondary'])
+        title_row.pack(fill=tk.X)
+
+        tk.Label(title_row, text='排行榜筛选', bg=THEME['bg_secondary'],
+                 fg=THEME['text'], font=(THEME['font_family'], 14, 'bold')).pack(side=tk.LEFT)
+        self._ranking_status_label = tk.Label(
+            title_row,
+            text='等待加载榜单数据',
+            bg=THEME['bg_secondary'],
+            fg=THEME['text_muted'],
+            font=(THEME['font_family'], 10),
+        )
+        self._ranking_status_label.pack(side=tk.RIGHT)
+
+        filter_row = tk.Frame(controls, bg=THEME['bg_secondary'])
+        filter_row.pack(fill=tk.X, pady=(14, 0))
 
         search_icon_img = get_icon('search', size=16, color=THEME['text_muted'])
         self._search_photo = ImageTk.PhotoImage(search_icon_img)
 
-        search_container = tk.Frame(search_frame, bg=THEME['bg_secondary'],
-                                     highlightbackground=THEME['border'],
-                                     highlightthickness=1)
-        search_container.pack(fill=tk.X)
+        search_container = tk.Frame(filter_row, bg=THEME['bg_tertiary'],
+                                    highlightbackground=THEME['border'],
+                                    highlightthickness=1)
+        search_container.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
 
         tk.Label(search_container, image=self._search_photo,
-                 bg=THEME['bg_secondary']).pack(side=tk.LEFT, padx=(12, 4))
+                 bg=THEME['bg_tertiary']).pack(side=tk.LEFT, padx=(12, 4))
 
-        self.search_var = tk.StringVar()
-        search_entry = tk.Entry(search_container, textvariable=self.search_var,
-                                bg=THEME['bg_secondary'], fg=THEME['text'],
-                                font=(THEME['font_family'], 11),
-                                relief='flat', bd=0,
-                                insertbackground=THEME['primary'])
+        self.search_var = tk.StringVar(value='搜索模型...')
+        search_entry = ttk.Entry(search_container, textvariable=self.search_var,
+                     style='Modern.TEntry', font=(THEME['font_family'], 11))
         search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=10)
-        self.search_var.set("搜索模型...")
-        self.search_var.trace_add('write', lambda *a: self._filter_ranking())
         search_entry.bind('<FocusIn>', lambda e: search_entry.delete(0, tk.END)
-                          if search_entry.get() == "搜索模型..." else None)
+                          if search_entry.get() == '搜索模型...' else None)
         search_entry.bind('<FocusOut>',
-                  lambda e: self.search_var.set("搜索模型...")
-                  if not search_entry.get().strip() else None)
+                          lambda e: self.search_var.set('搜索模型...')
+                          if not search_entry.get().strip() else None)
 
-        tk.Label(search_frame,
-             text="榜单分数已按当前样本区间放大显示，便于看出高分模型之间的细微差距。",
-             bg=THEME['bg'], fg=THEME['text_muted'],
-             font=(THEME['font_family'], 10)).pack(anchor='w', pady=(8, 0))
+        companies = ['全部公司'] + sorted({
+            item.get('company', '') for item in self.raw_data
+            if item.get('company') and item.get('company') != '未知'
+        })
+        categories = ['全部类别', '国内', '国际']
+        sort_rules = [
+            '综合分数：高到低',
+            '综合分数：低到高',
+            '代码生成：高到低',
+            '模型名称：A-Z',
+            '公司名称：A-Z',
+        ]
+        top_n_values = ['全部', '10', '25', '50', '100']
 
-        # Table frame
-        table_frame = tk.Frame(self.content_container, bg=THEME['bg_secondary'],
-                                highlightbackground=THEME['border'], highlightthickness=1)
-        table_frame.pack(fill=tk.BOTH, expand=True)
+        self.company_filter_var = tk.StringVar(value='全部公司')
+        self.category_filter_var = tk.StringVar(value='全部类别')
+        self.sort_var = tk.StringVar(value='综合分数：高到低')
+        self.top_n_var = tk.StringVar(value='全部')
+
+        def _add_filter(label_text, variable, values, width):
+            container = tk.Frame(filter_row, bg=THEME['bg_secondary'])
+            container.pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(container, text=label_text, bg=THEME['bg_secondary'],
+                     fg=THEME['text_muted'], font=(THEME['font_family'], 10)).pack(anchor='w')
+            combo = ttk.Combobox(container, textvariable=variable, values=values,
+                                 state='readonly', width=width, style='Modern.TCombobox')
+            combo.pack(pady=(6, 0))
+            return combo
+
+        _add_filter('类别', self.category_filter_var, categories, 8)
+        _add_filter('公司', self.company_filter_var, companies, 12)
+        _add_filter('排序', self.sort_var, sort_rules, 14)
+        _add_filter('显示数量', self.top_n_var, top_n_values, 6)
+
+        for variable in (self.search_var, self.category_filter_var, self.company_filter_var,
+                         self.sort_var, self.top_n_var):
+            variable.trace_add('write', lambda *args: self._filter_ranking())
+
+        tk.Label(controls,
+                 text='榜单分数会按当前样本区间放大显示，更适合区分高分模型之间的细微差距。',
+                 bg=THEME['bg_secondary'], fg=THEME['text_muted'],
+                 font=(THEME['font_family'], 10)).pack(anchor='w', pady=(12, 0))
+
+        table_card = self._create_card(self.content_container, padding=(14, 14), min_height=420)
+        table_card.pack(fill=tk.BOTH, expand=True)
+        table_frame = table_card.content
 
         columns = ('rank', 'model', 'company', 'category', 'avg_score', 'dimensions')
         self.ranking_tree = ttk.Treeview(table_frame, columns=columns,
@@ -506,13 +713,97 @@ class ModernApp:
         self.ranking_tree.column('dimensions', width=80, anchor='center')
 
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
-                                   command=self.ranking_tree.yview)
+                       style='Modern.Vertical.TScrollbar',
+                       command=self.ranking_tree.yview)
         self.ranking_tree.configure(yscrollcommand=scrollbar.set)
 
         self.ranking_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        detail_card = self._create_card(self.content_container, padding=(20, 18), min_height=150)
+        detail_card.pack(fill=tk.X, pady=(16, 0))
+        detail_content = detail_card.content
+
+        self._ranking_detail_title = tk.Label(detail_content, text='模型详情',
+                                              bg=THEME['bg_secondary'], fg=THEME['text'],
+                                              font=(THEME['font_family'], 14, 'bold'))
+        self._ranking_detail_title.pack(anchor='w')
+        self._ranking_detail_meta = tk.Label(detail_content, text='选择一个模型后会显示详情。',
+                                             bg=THEME['bg_secondary'], fg=THEME['text_secondary'],
+                                             font=(THEME['font_family'], 11), justify='left')
+        self._ranking_detail_meta.pack(anchor='w', pady=(8, 0))
+        self._ranking_detail_strength = tk.Label(detail_content, text='',
+                                                 bg=THEME['bg_secondary'], fg=THEME['text_muted'],
+                                                 font=(THEME['font_family'], 10), justify='left')
+        self._ranking_detail_strength.pack(anchor='w', pady=(10, 0))
+        self._ranking_detail_weakness = tk.Label(detail_content, text='',
+                                                 bg=THEME['bg_secondary'], fg=THEME['text_muted'],
+                                                 font=(THEME['font_family'], 10), justify='left')
+        self._ranking_detail_weakness.pack(anchor='w', pady=(6, 0))
+
+        self.ranking_tree.bind('<<TreeviewSelect>>', self._update_ranking_detail)
+
         self._populate_ranking()
+
+    def _get_ranking_rows(self):
+        model_data = self._get_model_dimension_scores()
+        all_avgs = [sum(info['scores'].values()) / len(info['scores'])
+                    for info in model_data.values() if info['scores']]
+
+        rows = []
+        for model, info in model_data.items():
+            dimension_scores = info['scores']
+            if not dimension_scores:
+                continue
+
+            avg = sum(dimension_scores.values()) / len(dimension_scores)
+            category = next((item.get('category', '') for item in self.raw_data
+                             if item.get('model') == model), '')
+            company = info['company']
+            rows.append({
+                'rank': self._global_rank_map.get(model, 0),
+                'model': model,
+                'company': company,
+                'category': category,
+                'category_display': '国内' if category == 'domestic' else '国际' if category == 'international' else category,
+                'avg': avg,
+                'scaled': scale_score(avg, all_avgs),
+                'dimensions': len(dimension_scores),
+                'code_score': dimension_scores.get('代码生成', 0),
+                'dimension_scores': dimension_scores,
+            })
+
+        search = self.search_var.get().strip() if hasattr(self, 'search_var') else ''
+        if search and search != '搜索模型...':
+            rows = [row for row in rows if search.lower() in row['model'].lower()]
+
+        company_filter = self.company_filter_var.get() if hasattr(self, 'company_filter_var') else '全部公司'
+        if company_filter and company_filter != '全部公司':
+            rows = [row for row in rows if row['company'] == company_filter]
+
+        category_filter = self.category_filter_var.get() if hasattr(self, 'category_filter_var') else '全部类别'
+        if category_filter == '国内':
+            rows = [row for row in rows if row['category'] == 'domestic']
+        elif category_filter == '国际':
+            rows = [row for row in rows if row['category'] == 'international']
+
+        sort_rule = self.sort_var.get() if hasattr(self, 'sort_var') else '综合分数：高到低'
+        if sort_rule == '综合分数：低到高':
+            rows.sort(key=lambda row: row['avg'])
+        elif sort_rule == '代码生成：高到低':
+            rows.sort(key=lambda row: row['code_score'], reverse=True)
+        elif sort_rule == '模型名称：A-Z':
+            rows.sort(key=lambda row: row['model'].lower())
+        elif sort_rule == '公司名称：A-Z':
+            rows.sort(key=lambda row: (row['company'].lower(), -row['avg']))
+        else:
+            rows.sort(key=lambda row: row['avg'], reverse=True)
+
+        top_n = self.top_n_var.get() if hasattr(self, 'top_n_var') else '全部'
+        if top_n.isdigit():
+            rows = rows[:int(top_n)]
+
+        return rows
 
     def _populate_ranking(self):
         if not hasattr(self, 'ranking_tree') or not self.ranking_tree.winfo_exists():
@@ -520,47 +811,61 @@ class ModernApp:
         for item in self.ranking_tree.get_children():
             self.ranking_tree.delete(item)
 
-        # Collect all average scores for score scaling
-        model_scores = {}
-        for d in self.filtered_data:
-            m = d.get('model', '')
-            if m not in model_scores:
-                model_scores[m] = []
-            model_scores[m].append(d.get('score', 0))
+        rows = self._get_ranking_rows()
+        self._ranking_row_map = {}
 
-        all_avgs = [sum(s) / len(s) for s in model_scores.values() if s]
+        for row in rows:
+            item_id = self.ranking_tree.insert('', tk.END,
+                                               values=(f"#{row['rank']}", row['model'], row['company'],
+                                                       row['category_display'], f"{row['scaled']:.2f}",
+                                                       row['dimensions']))
+            self._ranking_row_map[item_id] = row
 
-        for model in self.models:
-            scores = model_scores.get(model, [])
-            if not scores:
-                continue
+        if hasattr(self, '_ranking_status_label'):
+            self._ranking_status_label.config(
+                text=f"当前显示 {len(rows)} 个模型 · {self.sort_var.get() if hasattr(self, 'sort_var') else '综合分数：高到低'}"
+            )
 
-            # Check search filter
-            search = self.search_var.get() if hasattr(self, 'search_var') else ''
-            if search and search != "搜索模型...":
-                if search.lower() not in model.lower():
-                    continue
-
-            avg = sum(scores) / len(scores)
-            company = next((d.get('company', '') for d in self.filtered_data
-                           if d.get('model') == model), '')
-            category = next((d.get('category', '') for d in self.filtered_data
-                            if d.get('model') == model), '')
-
-            rank = self._global_rank_map.get(model, 0)
-
-            # Scale the score for display
-            scaled = scale_score(avg, all_avgs)
-
-            category_display = "国内" if category == 'domestic' else "国际" if category == 'international' else category
-
-            self.ranking_tree.insert('', tk.END,
-                                     values=(f"#{rank}", model, company,
-                                 category_display, f"{scaled:.2f}",
-                                             len(scores)))
+        children = self.ranking_tree.get_children()
+        if children:
+            first_item = children[0]
+            self.ranking_tree.selection_set(first_item)
+            self.ranking_tree.focus(first_item)
+            self._update_ranking_detail()
+        else:
+            self._ranking_detail_title.config(text='模型详情')
+            self._ranking_detail_meta.config(text='当前筛选条件下没有可显示的模型。')
+            self._ranking_detail_strength.config(text='')
+            self._ranking_detail_weakness.config(text='')
 
     def _filter_ranking(self):
         self._populate_ranking()
+
+    def _update_ranking_detail(self, _event=None):
+        if not hasattr(self, 'ranking_tree'):
+            return
+
+        selection = self.ranking_tree.selection()
+        if not selection:
+            return
+
+        row = self._ranking_row_map.get(selection[0])
+        if not row:
+            return
+
+        ordered_dims = sorted(row['dimension_scores'].items(), key=lambda item: item[1], reverse=True)
+        strongest = ' / '.join(f"{name} {score:.1f}" for name, score in ordered_dims[:3])
+        weakest = ' / '.join(f"{name} {score:.1f}" for name, score in ordered_dims[-2:])
+
+        self._ranking_detail_title.config(text=row['model'])
+        self._ranking_detail_meta.config(
+            text=(
+                f"{row['company']} · {row['category_display']} · 全局排名 #{row['rank']} · "
+                f"综合均分 {row['avg']:.2f} · 对比分 {row['scaled']:.2f}"
+            )
+        )
+        self._ranking_detail_strength.config(text=f"优势维度：{strongest}")
+        self._ranking_detail_weakness.config(text=f"待观察维度：{weakest}")
 
     # ==================== Analysis Tab ====================
 
@@ -570,10 +875,9 @@ class ModernApp:
 
         sorted_companies = self._get_top_company_flagships(limit=5)
 
-        # Chart frame
-        chart_frame = tk.Frame(self.content_container, bg=THEME['bg_secondary'],
-                                highlightbackground=THEME['border'], highlightthickness=1)
-        chart_frame.pack(fill=tk.BOTH, expand=True)
+        chart_card = self._create_card(self.content_container, padding=(0, 0), min_height=560)
+        chart_card.pack(fill=tk.BOTH, expand=True)
+        chart_frame = chart_card.content
 
         # Title
         title_frame = tk.Frame(chart_frame, bg=THEME['bg_secondary'])
@@ -654,21 +958,23 @@ class ModernApp:
         if not self.models:
             return
 
-        # Selection frame
-        sel_frame = tk.Frame(self.content_container, bg=THEME['bg_secondary'],
-                              highlightbackground=THEME['border'], highlightthickness=1)
-        sel_frame.pack(fill=tk.X, pady=(0, 16))
+        controls_card = self._create_card(self.content_container, padding=(20, 18))
+        controls_card.pack(fill=tk.X, pady=(0, 16))
+        inner = controls_card.content
 
-        inner = tk.Frame(sel_frame, bg=THEME['bg_secondary'])
-        inner.pack(padx=20, pady=16)
+        top_row = tk.Frame(inner, bg=THEME['bg_secondary'])
+        top_row.pack(fill=tk.X)
 
         icon_img = get_icon('compare', size=20, color=THEME['primary'])
         self._compare_photo = ImageTk.PhotoImage(icon_img)
-        tk.Label(inner, image=self._compare_photo,
+        tk.Label(top_row, image=self._compare_photo,
                  bg=THEME['bg_secondary']).pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Label(inner, text="模型对比", bg=THEME['bg_secondary'],
+        tk.Label(top_row, text="模型对比", bg=THEME['bg_secondary'],
                  fg=THEME['text'], font=(THEME['font_family'], 14, 'bold')).pack(side=tk.LEFT, padx=(0, 24))
+
+        selector_row = tk.Frame(inner, bg=THEME['bg_secondary'])
+        selector_row.pack(fill=tk.X, pady=(16, 0))
 
         # Sort models by score (descending) for the dropdown
         model_scores = {}
@@ -684,37 +990,83 @@ class ModernApp:
         self.model2_var = tk.StringVar()
 
         # Model 1 selector
-        tk.Label(inner, text="模型A:", bg=THEME['bg_secondary'],
+        tk.Label(selector_row, text="模型A:", bg=THEME['bg_secondary'],
                  fg=THEME['text_secondary'], font=(THEME['font_family'], 11)).pack(side=tk.LEFT, padx=(0, 4))
-        cb1 = ttk.Combobox(inner, textvariable=self.model1_var,
-                           values=sorted_models, state='readonly', width=24)
+        cb1 = ttk.Combobox(selector_row, textvariable=self.model1_var,
+                   values=sorted_models, state='readonly', width=24,
+                   style='Modern.TCombobox')
         cb1.pack(side=tk.LEFT, padx=(0, 16))
         if sorted_models:
             cb1.current(0)
 
         # Model 2 selector
-        tk.Label(inner, text="模型B:", bg=THEME['bg_secondary'],
+        tk.Label(selector_row, text="模型B:", bg=THEME['bg_secondary'],
                  fg=THEME['text_secondary'], font=(THEME['font_family'], 11)).pack(side=tk.LEFT, padx=(0, 4))
-        cb2 = ttk.Combobox(inner, textvariable=self.model2_var,
-                           values=sorted_models, state='readonly', width=24)
+        cb2 = ttk.Combobox(selector_row, textvariable=self.model2_var,
+                   values=sorted_models, state='readonly', width=24,
+                   style='Modern.TCombobox')
         cb2.pack(side=tk.LEFT, padx=(0, 16))
         if len(sorted_models) > 1:
             cb2.current(1)
 
         # Compare button
-        StyledButton(inner, "开始对比", self._do_compare,
+        StyledButton(selector_row, "开始对比", self._do_compare,
                      font_size=11).pack(side=tk.LEFT)
+        StyledButton(selector_row, "交换模型", self._swap_compare_models,
+                     font_size=11, color_key='secondary',
+                     text_color=THEME['text_secondary']).pack(side=tk.LEFT, padx=(8, 0))
+
+        dimension_header = tk.Frame(inner, bg=THEME['bg_secondary'])
+        dimension_header.pack(fill=tk.X, pady=(18, 0))
+
+        tk.Label(dimension_header, text='对比维度', bg=THEME['bg_secondary'],
+                 fg=THEME['text'], font=(THEME['font_family'], 11, 'bold')).pack(side=tk.LEFT)
+
+        actions = tk.Frame(dimension_header, bg=THEME['bg_secondary'])
+        actions.pack(side=tk.RIGHT)
+        StyledButton(actions, '全选维度', self._select_all_compare_dimensions,
+                     font_size=10, color_key='secondary',
+                     text_color=THEME['text_secondary']).pack(side=tk.LEFT)
+        StyledButton(actions, '仅代码生成', self._reset_compare_dimensions,
+                     font_size=10, color_key='secondary',
+                     text_color=THEME['text_secondary']).pack(side=tk.LEFT, padx=(8, 0))
+
+        dimension_grid = tk.Frame(inner, bg=THEME['bg_secondary'])
+        dimension_grid.pack(fill=tk.X, pady=(12, 0))
+        self._compare_dim_vars = {}
+        for index, dimension in enumerate(EVALUATION_DIMENSIONS):
+            var = tk.BooleanVar(value=(dimension == '代码生成'))
+            self._compare_dim_vars[dimension] = var
+            checkbox = tk.Checkbutton(
+                dimension_grid,
+                text=dimension,
+                variable=var,
+                command=self._maybe_refresh_compare,
+                bg=THEME['bg_secondary'],
+                activebackground=THEME['bg_secondary'],
+                selectcolor=THEME['bg_secondary'],
+                fg=THEME['text_secondary'],
+                font=(THEME['font_family'], 10),
+                anchor='w',
+                padx=0,
+            )
+            checkbox.grid(row=index // 4, column=index % 4, sticky='w', padx=(0, 18), pady=4)
 
         # Result area
         self.compare_result = tk.Frame(self.content_container, bg=THEME['bg'])
         self.compare_result.pack(fill=tk.BOTH, expand=True)
 
         if self.model1_var.get() and self.model2_var.get():
-            self.content_container.after_idle(self._do_compare)
+            self.content_container.after_idle(self._safe_auto_compare)
+
+    def _safe_auto_compare(self):
+        if hasattr(self, 'compare_result') and self.compare_result.winfo_exists():
+            self._do_compare()
 
     def _do_compare(self):
         m1 = self.model1_var.get()
         m2 = self.model2_var.get()
+        selected_dimensions = self._get_selected_compare_dimensions()
 
         if not m1 or not m2:
             messagebox.showwarning("提示", "请选择两个模型")
@@ -722,64 +1074,85 @@ class ModernApp:
         if m1 == m2:
             messagebox.showwarning("提示", "请选择不同的模型进行对比")
             return
-
-        for widget in self.compare_result.winfo_children():
-            widget.destroy()
-
-        m1_data = {d['dimension']: d['score'] for d in self.raw_data if d['model'] == m1}
-        m2_data = {d['dimension']: d['score'] for d in self.raw_data if d['model'] == m2}
-
-        if not m1_data or not m2_data:
-            messagebox.showwarning("提示", "模型数据不足")
+        if not selected_dimensions:
+            messagebox.showwarning("提示", "请至少选择一个对比维度")
             return
 
-        # Two-column layout: chart left, table right
-        result_container = tk.Frame(self.compare_result, bg=THEME['bg'])
-        result_container.pack(fill=tk.BOTH, expand=True)
+        if self._compare_rendering or not hasattr(self, 'compare_result') or not self.compare_result.winfo_exists():
+            return
 
-        # Left: radar chart comparison
-        chart_frame = tk.Frame(result_container, bg=THEME['bg_secondary'],
-                                highlightbackground=THEME['border'], highlightthickness=1)
-        chart_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+        self._compare_rendering = True
 
-        self._draw_compare_radar(chart_frame, m1, m2, m1_data, m2_data)
+        try:
+            for widget in self.compare_result.winfo_children():
+                widget.destroy()
 
-        # Right: comparison table
-        table_frame = tk.Frame(result_container, bg=THEME['bg_secondary'],
-                                highlightbackground=THEME['border'], highlightthickness=1)
-        table_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            m1_data = {d['dimension']: d['score'] for d in self.raw_data
+                       if d['model'] == m1 and d['dimension'] in selected_dimensions}
+            m2_data = {d['dimension']: d['score'] for d in self.raw_data
+                       if d['model'] == m2 and d['dimension'] in selected_dimensions}
 
-        tk.Label(table_frame, text=f"{m1} vs {m2}", bg=THEME['bg_secondary'],
-                 fg=THEME['primary'], font=(THEME['font_family'], 14, 'bold')).pack(pady=16)
+            if not m1_data or not m2_data:
+                messagebox.showwarning("提示", "模型数据不足")
+                return
 
-        tree = ttk.Treeview(table_frame, columns=('dim', 'm1', 'm2', 'diff', 'winner'),
-                            show='headings', height=10, style='Custom.Treeview')
+            # Two-column layout: chart left, table right
+            result_container = tk.Frame(self.compare_result, bg=THEME['bg'])
+            result_container.pack(fill=tk.BOTH, expand=True)
 
-        tree.heading('dim', text='维度')
-        tree.heading('m1', text='模型A')
-        tree.heading('m2', text='模型B')
-        tree.heading('diff', text='分差')
-        tree.heading('winner', text='胜出')
+            # Left: radar chart comparison
+            chart_card = self._create_card(result_container, padding=(0, 0), min_height=520)
+            chart_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+            chart_frame = chart_card.content
 
-        tree.column('dim', width=88, anchor='w')
-        tree.column('m1', width=78, anchor='center')
-        tree.column('m2', width=78, anchor='center')
-        tree.column('diff', width=68, anchor='center')
-        tree.column('winner', width=78, anchor='center')
+            if len(selected_dimensions) == 1:
+                self._draw_compare_single_dimension(chart_frame, m1, m2, m1_data, m2_data, selected_dimensions[0])
+            else:
+                self._draw_compare_radar(chart_frame, m1, m2, m1_data, m2_data, selected_dimensions)
 
-        for dim in EVALUATION_DIMENSIONS:
-            s1 = m1_data.get(dim, 0)
-            s2 = m2_data.get(dim, 0)
-            diff = s1 - s2
-            winner = "A胜" if s1 > s2 else "B胜" if s2 > s1 else "平局"
-            tree.insert('', tk.END, values=(dim, f"{s1:.2f}", f"{s2:.2f}",
-                                            f"{diff:+.2f}", winner))
+            # Right: comparison table
+            table_card = self._create_card(result_container, padding=(20, 18), min_height=520)
+            table_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            table_frame = table_card.content
 
-        tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+            tk.Label(table_frame, text=f"{m1}\nvs\n{m2}", bg=THEME['bg_secondary'],
+                     fg=THEME['primary'], font=(THEME['font_family'], 14, 'bold'),
+                     justify='center', wraplength=320).pack(pady=(0, 16))
 
-    def _draw_compare_radar(self, parent, m1, m2, m1_data, m2_data):
+            tk.Label(table_frame, text=f"当前维度：{'、'.join(selected_dimensions)}", bg=THEME['bg_secondary'],
+                     fg=THEME['text_muted'], font=(THEME['font_family'], 10),
+                     justify='center', wraplength=320).pack(pady=(0, 14))
+
+            tree = ttk.Treeview(table_frame, columns=('dim', 'm1', 'm2', 'diff', 'winner'),
+                                show='headings', height=10, style='Custom.Treeview')
+
+            tree.heading('dim', text='维度')
+            tree.heading('m1', text='模型A')
+            tree.heading('m2', text='模型B')
+            tree.heading('diff', text='分差')
+            tree.heading('winner', text='胜出')
+
+            tree.column('dim', width=88, anchor='w')
+            tree.column('m1', width=78, anchor='center')
+            tree.column('m2', width=78, anchor='center')
+            tree.column('diff', width=68, anchor='center')
+            tree.column('winner', width=78, anchor='center')
+
+            for dim in selected_dimensions:
+                s1 = m1_data.get(dim, 0)
+                s2 = m2_data.get(dim, 0)
+                diff = s1 - s2
+                winner = "A胜" if s1 > s2 else "B胜" if s2 > s1 else "平局"
+                tree.insert('', tk.END, values=(dim, f"{s1:.2f}", f"{s2:.2f}",
+                                                f"{diff:+.2f}", winner))
+
+            tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+        finally:
+            self._compare_rendering = False
+
+    def _draw_compare_radar(self, parent, m1, m2, m1_data, m2_data, selected_dimensions):
         """Draw comparison radar chart with zoomed range"""
-        n = len(EVALUATION_DIMENSIONS)
+        n = len(selected_dimensions)
         angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
         angles += angles[:1]
 
@@ -791,8 +1164,8 @@ class ModernApp:
         all_scores = list(m1_data.values()) + list(m2_data.values())
         min_range, max_range = get_score_range(all_scores, padding_ratio=0.12, minimum_padding=1.2)
 
-        v1 = [m1_data.get(dim, min_range) for dim in EVALUATION_DIMENSIONS] + [m1_data.get(EVALUATION_DIMENSIONS[0], min_range)]
-        v2 = [m2_data.get(dim, min_range) for dim in EVALUATION_DIMENSIONS] + [m2_data.get(EVALUATION_DIMENSIONS[0], min_range)]
+        v1 = [m1_data.get(dim, min_range) for dim in selected_dimensions] + [m1_data.get(selected_dimensions[0], min_range)]
+        v2 = [m2_data.get(dim, min_range) for dim in selected_dimensions] + [m2_data.get(selected_dimensions[0], min_range)]
 
         ax.plot(angles, v1, 'o-', linewidth=2, label='模型A', color=THEME['chart_colors'][0], markersize=5)
         ax.fill(angles, v1, alpha=0.15, color=THEME['chart_colors'][0])
@@ -800,7 +1173,7 @@ class ModernApp:
         ax.fill(angles, v2, alpha=0.15, color=THEME['chart_colors'][1])
 
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(EVALUATION_DIMENSIONS, fontsize=9, color=THEME['text'])
+        ax.set_xticklabels(selected_dimensions, fontsize=9, color=THEME['text'])
         ax.set_ylim(min_range, max_range)
 
         tick_count = 5
@@ -820,6 +1193,63 @@ class ModernApp:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
         plt.close(fig)
 
+    def _draw_compare_single_dimension(self, parent, m1, m2, m1_data, m2_data, dimension):
+        scores = [m1_data.get(dimension, 0), m2_data.get(dimension, 0)]
+        min_range, max_range = get_score_range(scores, padding_ratio=0.2, minimum_padding=1.0)
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        fig.patch.set_facecolor(THEME['bg_secondary'])
+        ax.set_facecolor(THEME['bg_secondary'])
+
+        bars = ax.bar(['模型A', '模型B'], scores,
+                      color=[THEME['chart_colors'][0], THEME['chart_colors'][1]],
+                      width=0.55)
+        ax.set_ylim(min_range, max_range)
+        ax.set_title(f'{dimension}维度对比', color=THEME['text'], fontsize=13, pad=14)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color(THEME['border'])
+        ax.spines['bottom'].set_color(THEME['border'])
+        ax.tick_params(axis='x', colors=THEME['text'])
+        ax.tick_params(axis='y', colors=THEME['text_muted'])
+        ax.grid(axis='y', color=THEME['border_light'], linestyle='--', linewidth=0.8)
+
+        for bar, value in zip(bars, scores):
+            ax.text(bar.get_x() + bar.get_width() / 2, value + 0.2,
+                    f'{value:.2f}', ha='center', va='bottom',
+                    color=THEME['text'], fontsize=10)
+
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        plt.close(fig)
+
+    def _get_selected_compare_dimensions(self):
+        return [dimension for dimension, var in self._compare_dim_vars.items() if var.get()]
+
+    def _maybe_refresh_compare(self):
+        if hasattr(self, 'compare_result') and self.compare_result.winfo_exists() and self.model1_var.get() and self.model2_var.get():
+            self._do_compare()
+
+    def _swap_compare_models(self):
+        model1 = self.model1_var.get()
+        model2 = self.model2_var.get()
+        if model1 and model2:
+            self.model1_var.set(model2)
+            self.model2_var.set(model1)
+            self._do_compare()
+
+    def _select_all_compare_dimensions(self):
+        for var in self._compare_dim_vars.values():
+            var.set(True)
+        self._maybe_refresh_compare()
+
+    def _reset_compare_dimensions(self):
+        for dimension, var in self._compare_dim_vars.items():
+            var.set(dimension == '代码生成')
+        self._maybe_refresh_compare()
+
     # ==================== Heatmap Tab ====================
 
     def _show_heatmap(self):
@@ -837,10 +1267,9 @@ class ModernApp:
         avg_scores = {m: sum(s) / len(s) for m, s in model_scores.items() if s}
         sorted_models = sorted(avg_scores.keys(), key=lambda m: avg_scores[m], reverse=True)[:15]
 
-        # Chart frame
-        chart_frame = tk.Frame(self.content_container, bg=THEME['bg_secondary'],
-                                highlightbackground=THEME['border'], highlightthickness=1)
-        chart_frame.pack(fill=tk.BOTH, expand=True)
+        chart_card = self._create_card(self.content_container, padding=(0, 0), min_height=620)
+        chart_card.pack(fill=tk.BOTH, expand=True)
+        chart_frame = chart_card.content
 
         title_frame = tk.Frame(chart_frame, bg=THEME['bg_secondary'])
         title_frame.pack(fill=tk.X, padx=20, pady=16)

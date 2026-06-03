@@ -98,6 +98,8 @@ def extract_company(model_name: str) -> str:
         ('gpt-4', 'OpenAI'),
         ('gpt-3.5', 'OpenAI'),
         ('gpt-5', 'OpenAI'),
+        ('o4-mini', 'OpenAI'),
+        ('o4-', 'OpenAI'),
         ('chatgpt', 'OpenAI'),
         ('gpt', 'OpenAI'),
         ('o1-', 'OpenAI'),
@@ -137,6 +139,7 @@ def extract_company(model_name: str) -> str:
         ('iflytek', '科大讯飞'),
         ('iflytek-spark', '科大讯飞'),
         ('spark', '科大讯飞'),
+        ('mimo', '小米'),
         ('minimax', 'MiniMax'),
         ('moonshot', '月之暗面'),
     ]
@@ -149,13 +152,15 @@ def extract_company(model_name: str) -> str:
 def rank_to_score(rank: int) -> float:
     """根据排名转换为分数"""
     if rank <= 10:
-        return 95.0 - (rank - 1) * 0.5
+        return 98.0 - (rank - 1) * 0.5
     elif rank <= 50:
-        return 90.0 - (rank - 10) * 0.3
+        return 93.0 - (rank - 10) * 0.5
     elif rank <= 100:
-        return 78.0 - (rank - 50) * 0.2
+        return 73.0 - (rank - 50) * 0.35
+    elif rank <= 200:
+        return 55.5 - (rank - 100) * 0.2
     else:
-        return 68.0 - (rank - 100) * 0.05
+        return 35.5 - (rank - 200) * 0.1
 
 
 def generate_dimensions(model_name: str, overall_rank: int) -> List[Dict]:
@@ -163,6 +168,7 @@ def generate_dimensions(model_name: str, overall_rank: int) -> List[Dict]:
     base_score = rank_to_score(overall_rank)
     random.seed(hash(model_name) + 42)
 
+    min_score = 10
     data = []
     for dim in DIMENSIONS:
         if dim == "数学能力":
@@ -175,7 +181,7 @@ def generate_dimensions(model_name: str, overall_rank: int) -> List[Dict]:
             adj = random.uniform(-2, 5)
         else:
             adj = random.uniform(-3, 3)
-        score = max(60, min(100, base_score + adj))
+        score = max(min_score, min(100, base_score + adj))
 
         data.append({
             "model": model_name,
@@ -260,6 +266,7 @@ def get_latest_models() -> List[Dict]:
 def get_simulated_data() -> List[Dict]:
     """生成模拟数据"""
     random.seed(42)
+    min_score = 10
 
     models = [
         ("DeepSeek-V3", "深度求索", "domestic", 92.5),
@@ -288,7 +295,7 @@ def get_simulated_data() -> List[Dict]:
                 "company": company,
                 "category": category,
                 "dimension": dim,
-                "score": round(max(60, min(100, base + adj)), 2),
+                "score": round(max(min_score, min(100, base + adj)), 2),
                 "timestamp": datetime.now().isoformat(),
                 "source": "simulated"
             })

@@ -62,18 +62,20 @@ class RoundedCard:
 
     def _sync_size(self, _event=None):
         req_height = self.content.winfo_reqheight() + self.pady * 2
-        req_width = self.content.winfo_reqwidth() + self.padx * 2
         if self.min_height is not None:
             req_height = max(req_height, self.min_height)
         self.canvas.configure(height=req_height)
-        self.canvas.configure(width=max(self.canvas.winfo_width(), req_width))
+        if self.canvas.winfo_width() <= 1:
+            self.canvas.configure(width=self.content.winfo_reqwidth() + self.padx * 2)
         self._redraw()
 
     def _on_configure(self, _event=None):
         self._redraw()
 
     def _redraw(self):
-        width = max(self.canvas.winfo_width(), self.content.winfo_reqwidth() + self.padx * 2)
+        width = self.canvas.winfo_width()
+        if width <= 1:
+            width = self.content.winfo_reqwidth() + self.padx * 2
         height = max(self.canvas.winfo_height(), self.content.winfo_reqheight() + self.pady * 2)
         if self.min_height is not None:
             height = max(height, self.min_height)
