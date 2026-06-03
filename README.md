@@ -1,6 +1,6 @@
 # LLM-Eval · 大语言模型评测分析系统
 
-一款桌面端 LLM 评测数据采集与可视化分析工具，基于 Tkinter 构建，参考 WordPress Dashboard 风格的清新浅色 UI。
+一款桌面端 LLM 评测数据采集与可视化分析工具，基于 Tkinter 构建的浅色主题 GUI 应用。
 
 ## 功能特性
 
