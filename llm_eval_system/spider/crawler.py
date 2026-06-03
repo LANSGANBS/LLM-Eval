@@ -3,6 +3,7 @@
 """
 import requests
 import json
+import re
 import time
 import logging
 import random
@@ -29,12 +30,34 @@ DIMENSIONS = ["语言理解", "逻辑推理", "知识问答", "代码生成",
 def classify_model(model_name: str) -> str:
     """根据模型名称判断是国内还是国际"""
     domestic_keywords = ['qwen', 'kimi', 'deepseek', 'glm', 'baichuan', 'yi-',
-                        'chatglm', 'sensechat', 'spark', 'tongyi', 'doubao',
+                        'chatglm', 'sensechat', 'spark-', 'spark-v', 'spark-prover', 'spark-formal', 'tongyi', 'doubao',
                         'ernie', 'wenxin', 'hunyuan', 'tencent', 'mimo',
                         'minimax', 'moonshot', 'iflytek', 'bytedance']
     name_lower = model_name.lower()
     for kw in domestic_keywords:
         if kw in name_lower:
+            return "domestic"
+    return "international"
+
+
+DOMESTIC_ORGS = {
+    '阿里巴巴', '百度', '字节跳动', '腾讯', '月之暗面', '深度求索',
+    '智谱AI', '百川智能', '零一万物', '商汤科技', '科大讯飞', '小米', 'MiniMax',
+}
+
+
+def classify_by_org(organization: str) -> str:
+    """根据公司/组织名称判断是国内还是国际"""
+    if not organization:
+        return None
+    if organization in DOMESTIC_ORGS:
+        return "domestic"
+    org_lower = organization.lower()
+    domestic_en = ['alibaba', 'baidu', 'bytedance', 'tencent', 'moonshot',
+                   'deepseek', 'zhipu', 'baichuan', '01.ai', 'sensetime',
+                   'iflytek', 'xiaomi', 'minimax', 'kimi', 'doubao', 'hunyuan']
+    for kw in domestic_en:
+        if kw in org_lower:
             return "domestic"
     return "international"
 
@@ -209,30 +232,112 @@ class ModelCrawler:
         try:
             resp = self.session.get("https://lmarena.ai/leaderboard", timeout=TIMEOUT)
             soup = BeautifulSoup(resp.text, 'html.parser')
-            table = soup.find('table')
-            if not table:
-                return data
 
-            rows = table.find_all('tr')[1:]
-            seen_models = set()
-            for i, row in enumerate(rows):
-                cells = row.find_all(['td', 'th'])
-                if len(cells) >= 3:
-                    raw_name = cells[0].get_text(strip=True)
+            # Extract rich model data from embedded Next.js RSC payload
+            entries = self._extract_entries_from_rsc(soup)
+
+            if entries:
+                seen_models = set()
+                for entry in entries:
+                    raw_name = entry.get('modelDisplayName', '')
                     formatted_name = format_model_name(raw_name)
                     if formatted_name in seen_models:
                         continue
                     seen_models.add(formatted_name)
-                    try:
-                        overall_rank = int(cells[1].get_text(strip=True))
-                    except (ValueError, IndexError):
-                        overall_rank = i + 1
-                    model_data = generate_dimensions(formatted_name, overall_rank)
+
+                    rank = entry.get('rank', 0)
+                    rating = entry.get('rating', 0)
+                    votes = entry.get('votes', 0)
+                    org = entry.get('modelOrganization', '')
+                    license_type = entry.get('license', '')
+                    input_price = entry.get('inputPricePerMillion')
+                    output_price = entry.get('outputPricePerMillion')
+                    context_len = entry.get('contextLength')
+
+                    model_data = generate_dimensions(formatted_name, rank)
+                    # Enrich each dimension record with extra fields
+                    for rec in model_data:
+                        rec['company'] = org or extract_company(formatted_name)
+                        # Use org to classify domestic/international when available
+                        org_category = classify_by_org(org) if org else None
+                        if org_category:
+                            rec['category'] = org_category
+                        rec['rating'] = rating
+                        rec['votes'] = votes
+                        rec['license'] = license_type
+                        rec['inputPricePerMillion'] = input_price
+                        rec['outputPricePerMillion'] = output_price
+                        rec['contextLength'] = context_len
+                        rec['modelUrl'] = entry.get('modelUrl', '')
+                        rec['source'] = 'LMSYS Arena'
                     data.extend(model_data)
+            else:
+                # Fallback: parse HTML table (less data)
+                table = soup.find('table')
+                if not table:
+                    return data
+                rows = table.find_all('tr')[1:]
+                seen_models = set()
+                for i, row in enumerate(rows):
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) >= 3:
+                        raw_name = cells[0].get_text(strip=True)
+                        formatted_name = format_model_name(raw_name)
+                        if formatted_name in seen_models:
+                            continue
+                        seen_models.add(formatted_name)
+                        try:
+                            overall_rank = int(cells[1].get_text(strip=True))
+                        except (ValueError, IndexError):
+                            overall_rank = i + 1
+                        model_data = generate_dimensions(formatted_name, overall_rank)
+                        data.extend(model_data)
         except Exception as e:
             logger.debug(f"爬取失败，回退到模拟数据: {e}")
             raise CrawlerException(f"爬取失败: {e}")
         return data
+
+    def _extract_entries_from_rsc(self, soup) -> List[Dict]:
+        """Extract model entries from Next.js RSC payload in script tags."""
+        scripts = soup.find_all('script')
+        for script in scripts:
+            raw = str(script)
+            if 'votes' not in raw or 'contextLength' not in raw:
+                continue
+            content = script.string or ''
+            if not content:
+                continue
+
+            # Find 'entries' in the text arena (first occurrence)
+            idx = content.find('entries')
+            if idx < 0:
+                continue
+
+            arr_start = content.find('[', idx)
+            if arr_start < 0:
+                continue
+
+            chunk = content[arr_start:arr_start + 500000]
+            # Unescape double-escaped quotes
+            chunk = chunk.replace('\\"', '"')
+
+            # Find matching closing bracket
+            depth = 0
+            end = 0
+            for j, c in enumerate(chunk):
+                if c == '[':
+                    depth += 1
+                elif c == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+
+            try:
+                return json.loads(chunk[:end + 1])
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return []
 
     @safe_operation
     def crawl_with_progress(self, progress_callback=None) -> List[Dict]:
@@ -251,43 +356,43 @@ class ModelCrawler:
             raise
 
 
-def get_latest_models() -> List[Dict]:
+def get_latest_models(minimum_rows: int = 1, fallback_to_simulated: bool = True) -> List[Dict]:
     """获取最新模型数据 - 优先使用爬虫，失败时返回模拟数据"""
     crawler = ModelCrawler()
     try:
         data = crawler.crawl_lmarena()
-        if data:
+        if data and len(data) >= minimum_rows:
             return data
     except Exception:
         pass
-    return get_simulated_data()
+    return get_simulated_data() if fallback_to_simulated else []
 
 
 def get_simulated_data() -> List[Dict]:
-    """生成模拟数据"""
+    """生成模拟数据（含 Score/Votes/Price/Context/License）"""
     random.seed(42)
     min_score = 10
 
     models = [
-        ("DeepSeek-V3", "深度求索", "domestic", 92.5),
-        ("通义千问2.5", "阿里巴巴", "domestic", 89.8),
-        ("Kimi K1.5", "月之暗面", "domestic", 88.3),
-        ("豆包Pro", "字节跳动", "domestic", 86.5),
-        ("智谱清言GLM-4", "智谱AI", "domestic", 85.9),
-        ("文心一言4.0", "百度", "domestic", 84.2),
-        ("讯飞星火V4.0", "科大讯飞", "domestic", 82.7),
-        ("商量SenseChat", "商汤科技", "domestic", 81.4),
-        ("GPT-4o", "OpenAI", "international", 94.5),
-        ("Claude 3.5 Sonnet", "Anthropic", "international", 92.8),
-        ("Gemini 2.0 Flash", "Google", "international", 93.2),
-        ("o1", "OpenAI", "international", 95.1),
-        ("LLaMA 3.1", "Meta", "international", 89.3),
-        ("Mistral Large", "Mistral AI", "international", 87.6),
-        ("Grok 2", "xAI", "international", 85.8),
+        ("DeepSeek-V3", "深度求索", "domestic", 92.5, 1400, "MIT", 0.27, 1.10, 131072),
+        ("通义千问2.5", "阿里巴巴", "domestic", 89.8, 1350, "Apache 2.0", 0.50, 2.00, 131072),
+        ("Kimi K1.5", "月之暗面", "domestic", 88.3, 1100, "Modified MIT", 2.50, 8.00, 131072),
+        ("豆包Pro", "字节跳动", "domestic", 86.5, 980, "Proprietary", 0.50, 2.00, 128000),
+        ("智谱清言GLM-4", "智谱AI", "domestic", 85.9, 920, "Apache 2.0", 0.70, 2.80, 128000),
+        ("文心一言4.0", "百度", "domestic", 84.2, 860, "Proprietary", 2.00, 8.00, 128000),
+        ("讯飞星火V4.0", "科大讯飞", "domestic", 82.7, 750, "Proprietary", 1.50, 6.00, 32768),
+        ("商量SenseChat", "商汤科技", "domestic", 81.4, 680, "Apache 2.0", 1.00, 4.00, 32768),
+        ("GPT-4o", "OpenAI", "international", 94.5, 1600, "Proprietary", 2.50, 10.00, 128000),
+        ("Claude 3.5 Sonnet", "Anthropic", "international", 92.8, 1520, "Proprietary", 3.00, 15.00, 200000),
+        ("Gemini 2.0 Flash", "Google", "international", 93.2, 1550, "Proprietary", 0.10, 0.40, 1048576),
+        ("o1", "OpenAI", "international", 95.1, 1650, "Proprietary", 15.00, 60.00, 200000),
+        ("LLaMA 3.1", "Meta", "international", 89.3, 1300, "MIT", 0.00, 0.00, 131072),
+        ("Mistral Large", "Mistral AI", "international", 87.6, 1200, "Proprietary", 2.00, 6.00, 128000),
+        ("Grok 2", "xAI", "international", 85.8, 1050, "Proprietary", 5.00, 15.00, 131072),
     ]
 
     data = []
-    for model_name, company, category, base in models:
+    for model_name, company, category, base, rating, license_type, input_price, output_price, context_len in models:
         for dim in DIMENSIONS:
             adj = random.uniform(-2, 3)
             data.append({
@@ -296,6 +401,12 @@ def get_simulated_data() -> List[Dict]:
                 "category": category,
                 "dimension": dim,
                 "score": round(max(min_score, min(100, base + adj)), 2),
+                "rating": rating,
+                "votes": random.randint(5000, 40000),
+                "license": license_type,
+                "inputPricePerMillion": input_price,
+                "outputPricePerMillion": output_price,
+                "contextLength": context_len,
                 "timestamp": datetime.now().isoformat(),
                 "source": "simulated"
             })

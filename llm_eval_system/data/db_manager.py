@@ -224,6 +224,73 @@ class DatabaseManager:
             raise DatabaseException(f"获取评测结果失败: {e}")
     
     @handle_exception
+    def load_all_data(self) -> List[Dict]:
+        """从数据库加载全部评测数据（包含 metadata 中的额外字段）"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT m.name as model, m.category, m.metadata,
+                       e.dimension, e.score, e.source
+                FROM evaluations e
+                JOIN models m ON e.model_id = m.id
+                WHERE m.is_active = 1
+                ORDER BY m.name, e.dimension
+            ''')
+            rows = cursor.fetchall()
+            if not rows:
+                return []
+            result = []
+            for row in rows:
+                item = {
+                    'model': row['model'],
+                    'category': row['category'],
+                    'dimension': row['dimension'],
+                    'score': row['score'],
+                    'source': row['source'] or 'database',
+                }
+                # Restore extra fields from metadata JSON
+                metadata_str = row['metadata']
+                if metadata_str:
+                    try:
+                        metadata = json.loads(metadata_str)
+                        for key in ('company', 'rating', 'votes', 'license', 'modelUrl',
+                                    'inputPricePerMillion', 'outputPricePerMillion',
+                                    'contextLength'):
+                            if key in metadata:
+                                item[key] = metadata[key]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append(item)
+            return result
+        except sqlite3.Error as e:
+            logger.error(f"加载数据库数据失败: {e}")
+            return []
+
+    @handle_exception
+    def has_data(self) -> bool:
+        """检查数据库是否有评测数据"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM evaluations')
+            return cursor.fetchone()[0] > 0
+        except sqlite3.Error:
+            return False
+
+    @handle_exception
+    def clear_all_data(self):
+        """清空所有评测和模型数据"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM evaluations')
+            cursor.execute('DELETE FROM models')
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"清空数据失败: {e}")
+
+    @handle_exception
     def get_all_evaluations_with_models(self) -> List[Dict]:
         """获取所有评测结果（包含模型信息）"""
         try:
