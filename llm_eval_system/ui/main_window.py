@@ -50,6 +50,32 @@ matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'STHeiti',
     'Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
+TEXT_ARENA_SET = {'text', 'code', 'vision', 'document', 'search', 'image-to-code', ''}
+IMAGE_ARENA_SET = {'text-to-image', 'image-edit'}
+VIDEO_ARENA_SET = {'text-to-video', 'image-to-video', 'video-to-video'}
+
+ARENA_CHOICES = [
+    ('综合领域', 'text'),
+    ('代码', 'code'),
+    ('文档理解', 'document'),
+    ('搜索', 'search'),
+    ('视觉', 'vision'),
+    ('文生图', 'text-to-image'),
+    ('图片编辑', 'image-edit'),
+    ('文生视频', 'text-to-video'),
+]
+
+ARENA_SLUG_TO_DIMS = {
+    'text': None,
+    'code': ['代码生成'],
+    'document': ['知识问答'],
+    'search': ['逻辑推理'],
+    'vision': ['多语言能力'],
+    'text-to-image': ['文生图'],
+    'image-edit': ['图片编辑'],
+    'text-to-video': ['文生视频'],
+}
+
 
 def scale_score(score, all_scores=None):
     """将分数映射到当前数据带宽内，放大细微差距但不脱离真实区间。"""
@@ -99,8 +125,11 @@ class ModernApp:
         self.filtered_data = []
         self.models = []
         self.current_tab = 'ranking'
+        self.current_arena = 'text'
+        self._arena_data = {}
+        self._arena_models = {}
+        self._arena_rank_map = {}
         self.content_container = None
-        self._global_rank_map = {}
         self._is_loading = False
         self._render_pending = False
         self._photo_refs = []  # Keep references to PhotoImage objects
@@ -282,6 +311,20 @@ class ModernApp:
 
     def _build_sidebar(self):
         """构建侧边栏 - 可滚动"""
+        # Arena selector section
+        arena_label = tk.Label(self.sidebar, text="评测领域", bg=THEME['bg_secondary'],
+                               fg=THEME['text_muted'], font=(THEME['font_family'], 10),
+                               anchor='w')
+        arena_label.pack(fill=tk.X, padx=16, pady=(20, 8))
+
+        arena_names = [label for label, _ in ARENA_CHOICES]
+        self.arena_var = tk.StringVar(value='综合领域')
+        arena_combo = ttk.Combobox(self.sidebar, textvariable=self.arena_var,
+                                   values=arena_names, state='readonly', width=18,
+                                   style='Modern.TCombobox')
+        arena_combo.pack(fill=tk.X, padx=16, pady=(0, 4))
+        arena_combo.bind('<<ComboboxSelected>>', self._on_arena_changed)
+
         # Navigation section
         nav_label = tk.Label(self.sidebar, text="导航", bg=THEME['bg_secondary'],
                              fg=THEME['text_muted'], font=(THEME['font_family'], 10),
@@ -354,6 +397,30 @@ class ModernApp:
 
         # Ensure sidebar has enough space for scrolling
         self.sidebar.update_idletasks()
+
+    def _on_arena_changed(self, _event=None):
+        selected = self.arena_var.get()
+        slug = dict(ARENA_CHOICES).get(selected, 'text')
+        if slug == self.current_arena:
+            return
+        self.current_arena = slug
+        self.models = self._arena_models.get(slug, [])
+
+        # Update radar nav label based on arena
+        if hasattr(self, '_nav_buttons') and 'radar' in self._nav_buttons:
+            self._nav_buttons['radar'].update_text('雷达图' if slug == 'text' else '能力对比')
+
+        arena_data = self._get_current_arena_data()
+        avg_scores = {}
+        for item in arena_data:
+            m = item.get('model', '')
+            if m not in avg_scores:
+                avg_scores[m] = []
+            avg_scores[m].append(item.get('score', 0))
+        avg_scores = {m: sum(s) / len(s) for m, s in avg_scores.items() if s}
+        self._update_stats(arena_data, avg_scores)
+
+        self._switch_tab(self.current_tab)
 
     def _widget_contains_point(self, widget, x_root, y_root):
         if not widget or not widget.winfo_exists():
@@ -557,27 +624,43 @@ class ModernApp:
         self.raw_data = data
         self.filtered_data = data
 
-        # Build model list sorted by average score (descending)
-        model_scores = {}
+        # Group data by arena slug
+        self._arena_data = {}
         for item in data:
-            m = item.get('model', '')
-            if m not in model_scores:
-                model_scores[m] = []
-            model_scores[m].append(item.get('score', 0))
+            arena = item.get('arena', 'text') or 'text'
+            self._arena_data.setdefault(arena, []).append(item)
 
-        avg_scores = {m: sum(s) / len(s) for m, s in model_scores.items()}
-        self.models = sorted(avg_scores.keys(), key=lambda m: avg_scores[m], reverse=True)
+        # Build per-arena model lists and rank maps (sorted by Arena Score / Elo rating)
+        self._arena_models = {}
+        self._arena_rank_map = {}
+        for arena, items in self._arena_data.items():
+            model_ratings = {}
+            for item in items:
+                m = item.get('model', '')
+                r = item.get('rating', 0)
+                if m not in model_ratings or r > model_ratings[m]:
+                    model_ratings[m] = r
+            sorted_models = sorted(model_ratings.keys(),
+                                   key=lambda m: model_ratings[m], reverse=True)
+            self._arena_models[arena] = sorted_models
+            self._arena_rank_map[arena] = {m: i + 1 for i, m in enumerate(sorted_models)}
 
-        # Build global rank map
-        self._global_rank_map = {}
-        for i, model in enumerate(self.models):
-            self._global_rank_map[model] = i + 1
+        # Default model list = current arena
+        self.models = self._arena_models.get(self.current_arena, [])
 
         # Save to database
         self._save_to_db(data)
 
         # Update sidebar stats
-        self._update_stats(data, avg_scores)
+        arena_data = self._get_current_arena_data()
+        avg_scores = {}
+        for item in arena_data:
+            m = item.get('model', '')
+            if m not in avg_scores:
+                avg_scores[m] = []
+            avg_scores[m].append(item.get('score', 0))
+        avg_scores = {m: sum(s) / len(s) for m, s in avg_scores.items() if s}
+        self._update_stats(arena_data, avg_scores)
 
         # Refresh current tab
         self._switch_tab(self.current_tab)
@@ -595,7 +678,7 @@ class ModernApp:
 
                 # Store extra fields in metadata JSON
                 metadata = {}
-                for key in ('company', 'rating', 'votes', 'license', 'modelUrl',
+                for key in ('company', 'rating', 'votes', 'license', 'modelUrl', 'arena',
                             'inputPricePerMillion', 'outputPricePerMillion',
                             'contextLength'):
                     if item.get(key) is not None:
@@ -608,6 +691,12 @@ class ModernApp:
                 self.db.insert_evaluation(model_id, dimension, score)
         except Exception:
             pass  # Silently handle DB errors
+
+    def _get_current_arena_data(self):
+        return self._arena_data.get(self.current_arena, [])
+
+    def _get_current_arena_models(self):
+        return self._arena_models.get(self.current_arena, [])
 
     def _update_stats(self, data, avg_scores):
         if not data:
@@ -712,24 +801,22 @@ class ModernApp:
                           if not search_entry.get().strip() else None)
 
         companies = ['全部公司'] + sorted({
-            item.get('company', '') for item in self.raw_data
+            item.get('company', '') for item in self._get_current_arena_data()
             if item.get('company') and item.get('company') != '未知'
         })
         categories = ['全部类别', '国内', '国际']
         sort_rules = [
-            '综合分数：高到低',
-            '综合分数：低到高',
             'Arena Score：高到低',
+            '综合均分：高到低',
+            '综合均分：低到高',
             'Votes：多到少',
             '代码生成：高到低',
-            '模型名称：A-Z',
-            '公司名称：A-Z',
         ]
         top_n_values = ['全部', '10', '25', '50', '100']
 
         self.company_filter_var = tk.StringVar(value='全部公司')
         self.category_filter_var = tk.StringVar(value='全部类别')
-        self.sort_var = tk.StringVar(value='综合分数：高到低')
+        self.sort_var = tk.StringVar(value='Arena Score：高到低')
         self.top_n_var = tk.StringVar(value='全部')
 
         def _add_filter(label_text, variable, values, width):
@@ -833,13 +920,26 @@ class ModernApp:
         self._populate_ranking()
 
     def _get_ranking_rows(self):
-        model_data = self._get_model_dimension_scores()
+        arena_data = self._get_current_arena_data()
+        rank_map = self._arena_rank_map.get(self.current_arena, {})
+
+        model_data = {}
+        for item in arena_data:
+            model = item.get('model', '')
+            dimension = item.get('dimension', '')
+            if not model or not dimension:
+                continue
+            entry = model_data.setdefault(model, {
+                'company': item.get('company', '未知'),
+                'scores': {}
+            })
+            entry['scores'][dimension] = item.get('score', 0)
+
         all_avgs = [sum(info['scores'].values()) / len(info['scores'])
                     for info in model_data.values() if info['scores']]
 
-        # Extract extra fields per model from raw_data
         model_extras = {}
-        for item in self.raw_data:
+        for item in arena_data:
             model = item.get('model', '')
             if model not in model_extras:
                 model_extras[model] = {
@@ -852,6 +952,10 @@ class ModernApp:
                     'contextLength': item.get('contextLength'),
                     'modelUrl': item.get('modelUrl', ''),
                 }
+            if item.get('rating', 0) > model_extras[model].get('rating', 0):
+                model_extras[model]['rating'] = item['rating']
+            if item.get('votes', 0) > model_extras[model].get('votes', 0):
+                model_extras[model]['votes'] = item['votes']
 
         rows = []
         for model, info in model_data.items():
@@ -864,7 +968,7 @@ class ModernApp:
             category = extras.get('category', '')
             company = info['company']
             rows.append({
-                'rank': self._global_rank_map.get(model, 0),
+                'rank': rank_map.get(model, 0),
                 'model': model,
                 'company': company,
                 'license': extras.get('license', ''),
@@ -897,21 +1001,17 @@ class ModernApp:
         elif category_filter == '国际':
             rows = [row for row in rows if row['category'] == 'international']
 
-        sort_rule = self.sort_var.get() if hasattr(self, 'sort_var') else '综合分数：高到低'
-        if sort_rule == '综合分数：低到高':
+        sort_rule = self.sort_var.get() if hasattr(self, 'sort_var') else 'Arena Score：高到低'
+        if sort_rule == '综合均分：高到低':
+            rows.sort(key=lambda row: row['avg'], reverse=True)
+        elif sort_rule == '综合均分：低到高':
             rows.sort(key=lambda row: row['avg'])
-        elif sort_rule == 'Arena Score：高到低':
-            rows.sort(key=lambda row: row.get('rating', 0) or 0, reverse=True)
         elif sort_rule == 'Votes：多到少':
             rows.sort(key=lambda row: row.get('votes', 0) or 0, reverse=True)
         elif sort_rule == '代码生成：高到低':
             rows.sort(key=lambda row: row['code_score'], reverse=True)
-        elif sort_rule == '模型名称：A-Z':
-            rows.sort(key=lambda row: row['model'].lower())
-        elif sort_rule == '公司名称：A-Z':
-            rows.sort(key=lambda row: (row['company'].lower(), -row['avg']))
         else:
-            rows.sort(key=lambda row: row['avg'], reverse=True)
+            rows.sort(key=lambda row: row.get('rating', 0) or 0, reverse=True)
 
         top_n = self.top_n_var.get() if hasattr(self, 'top_n_var') else '全部'
         if top_n.isdigit():
@@ -932,7 +1032,7 @@ class ModernApp:
             company_license = row['company']
             if row.get('license'):
                 company_license = f"{row['company']} · {row['license']}"
-            score_str = f"{row['rating']:.0f}" if row.get('rating') else f"{row['scaled']:.2f}"
+            score_str = f"{row['rating']:.0f}" if row.get('rating') else '-'
             votes_str = f"{row['votes']:,}" if row.get('votes') else '-'
             price_str = '-'
             if row.get('inputPrice') is not None and row.get('outputPrice') is not None:
@@ -1083,15 +1183,17 @@ class ModernApp:
         selector_container.grid_columnconfigure(1, weight=0)
         selector_container.grid_columnconfigure(2, weight=1, uniform='model')
 
-        # Sort models by score (descending) for the dropdown
+        # Sort models by score (descending) for the dropdown — current arena only
+        arena_data = self._get_current_arena_data()
         model_scores = {}
-        for d in self.raw_data:
+        for d in arena_data:
             m = d.get('model', '')
             if m not in model_scores:
                 model_scores[m] = []
             model_scores[m].append(d.get('score', 0))
         avg_scores = {m: sum(s) / len(s) for m, s in model_scores.items() if s}
-        sorted_models = sorted(self.models, key=lambda m: avg_scores.get(m, 0), reverse=True)[:30]
+        sorted_models = sorted(self._get_current_arena_models(),
+                               key=lambda m: avg_scores.get(m, 0), reverse=True)[:30]
 
         self.model1_var = tk.StringVar()
         self.model2_var = tk.StringVar()
@@ -1157,11 +1259,16 @@ class ModernApp:
                      font_size=10, color_key='secondary',
                      text_color=THEME['text_secondary']).pack(side=tk.LEFT, padx=(8, 0))
 
+        arena_data = self._get_current_arena_data()
+        current_dims = sorted({d.get('dimension', '') for d in arena_data if d.get('dimension')})
+        if not current_dims:
+            current_dims = EVALUATION_DIMENSIONS
+
         dimension_grid = tk.Frame(inner, bg=THEME['bg_secondary'])
         dimension_grid.pack(fill=tk.X, pady=(10, 0))
         self._compare_dim_vars = {}
-        for index, dimension in enumerate(EVALUATION_DIMENSIONS):
-            var = tk.BooleanVar(value=(dimension == '代码生成'))
+        for index, dimension in enumerate(current_dims):
+            var = tk.BooleanVar(value=True)
             self._compare_dim_vars[dimension] = var
             checkbox = tk.Checkbutton(
                 dimension_grid,
@@ -1213,9 +1320,10 @@ class ModernApp:
             for widget in self.compare_result.winfo_children():
                 widget.destroy()
 
-            m1_data = {d['dimension']: d['score'] for d in self.raw_data
+            arena_data = self._get_current_arena_data()
+            m1_data = {d['dimension']: d['score'] for d in arena_data
                        if d['model'] == m1 and d['dimension'] in selected_dimensions}
-            m2_data = {d['dimension']: d['score'] for d in self.raw_data
+            m2_data = {d['dimension']: d['score'] for d in arena_data
                        if d['model'] == m2 and d['dimension'] in selected_dimensions}
 
             if not m1_data or not m2_data:
@@ -1441,10 +1549,16 @@ class ModernApp:
     # ==================== Radar Tab ====================
 
     def _show_radar(self):
-        if not self.raw_data:
+        if not self._get_current_arena_data():
             return
 
         companies = self._get_top_company_flagships(limit=5)
+        arena_data = self._get_current_arena_data()
+        current_dims = sorted({d.get('dimension', '') for d in arena_data if d.get('dimension')})
+        n_dims = len(current_dims) if current_dims else len(EVALUATION_DIMENSIONS)
+
+        chart_label = "能力雷达图" if n_dims >= 3 else "能力对比图"
+        dim_desc = f"各公司最高分模型的{n_dims}维度能力对比" if n_dims >= 2 else "各公司最高分模型得分对比"
 
         # Title card
         title_card = self._create_card(self.content_container, padding=(20, 16))
@@ -1455,22 +1569,25 @@ class ModernApp:
         self._radar_tab_photo = ImageTk.PhotoImage(icon_img)
         tk.Label(title_frame, image=self._radar_tab_photo,
                  bg=THEME['bg_secondary']).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(title_frame, text="旗舰模型能力雷达图", bg=THEME['bg_secondary'],
+        tk.Label(title_frame, text=f"旗舰模型{chart_label}", bg=THEME['bg_secondary'],
                  fg=THEME['text'], font=(THEME['font_family'], 14, 'bold')).pack(side=tk.LEFT, padx=(0, 16))
-        tk.Label(title_frame, text="各公司最高分模型的八维度能力对比",
+        tk.Label(title_frame, text=dim_desc,
                  bg=THEME['bg_secondary'], fg=THEME['text_muted'],
                  font=(THEME['font_family'], 10)).pack(side=tk.LEFT)
 
-        # Two-column layout: radar left, model cards right
+        # Two-column layout: chart left, model cards right
         content_row = tk.Frame(self.content_container, bg=THEME['bg'])
         content_row.pack(fill=tk.BOTH, expand=True)
         content_row.grid_columnconfigure(0, weight=3)
         content_row.grid_columnconfigure(1, weight=2)
 
-        # Left: radar chart
+        # Left: chart
         chart_card = self._create_card(content_row, padding=(0, 0), min_height=520)
         chart_card.grid(row=0, column=0, sticky='nsew', padx=(0, 12))
-        self._draw_radar_chart(chart_card.content, companies, large=True)
+        if n_dims >= 3:
+            self._draw_radar_chart(chart_card.content, companies, large=True)
+        else:
+            self._draw_flagship_bar(chart_card.content, companies, current_dims)
 
         # Right: model info cards
         info_card = self._create_card(content_row, padding=(16, 16), min_height=520)
@@ -1530,12 +1647,14 @@ class ModernApp:
     # ==================== Heatmap Tab ====================
 
     def _show_heatmap(self):
-        if not self.raw_data:
+        if not self._get_current_arena_data():
             return
+
+        arena_data = self._get_current_arena_data()
 
         # Get top 15 models by average score
         model_scores = {}
-        for d in self.raw_data:
+        for d in arena_data:
             m = d.get('model', '')
             if m not in model_scores:
                 model_scores[m] = []
@@ -1544,11 +1663,16 @@ class ModernApp:
         avg_scores = {m: sum(s) / len(s) for m, s in model_scores.items() if s}
         sorted_models = sorted(avg_scores.keys(), key=lambda m: avg_scores[m], reverse=True)[:15]
 
+        # Determine dimensions for current arena
+        current_dims = sorted({d.get('dimension', '') for d in arena_data if d.get('dimension')})
+        if not current_dims:
+            current_dims = EVALUATION_DIMENSIONS
+
         # Build score matrix once
-        matrix = np.zeros((len(sorted_models), len(EVALUATION_DIMENSIONS)))
+        matrix = np.zeros((len(sorted_models), len(current_dims)))
         for i, model in enumerate(sorted_models):
-            for j, dim in enumerate(EVALUATION_DIMENSIONS):
-                for d in self.raw_data:
+            for j, dim in enumerate(current_dims):
+                for d in arena_data:
                     if d.get('model') == model and d.get('dimension') == dim:
                         matrix[i, j] = d.get('score', 0)
                         break
@@ -1575,11 +1699,11 @@ class ModernApp:
             large_card.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
 
             chart_methods = {
-                1: lambda p: self._draw_heatmap_chart(p, sorted_models, matrix, large=True),
+                1: lambda p: self._draw_heatmap_chart(p, sorted_models, matrix, current_dims, large=True),
                 2: lambda p: self._draw_confidence_chart(p, sorted_models, avg_scores, large=True),
                 3: lambda p: self._draw_price_rating_scatter(p, large=True),
-                4: lambda p: self._draw_ranking_bar_chart(p, sorted_models, matrix, large=True),
-                5: lambda p: self._draw_license_comparison(p, large=True),
+                4: lambda p: self._draw_ranking_bar_chart(p, sorted_models, matrix, current_dims, large=True),
+                5: lambda p: self._draw_license_comparison(p, current_dims, large=True),
                 6: lambda p: self._draw_votes_chart(p, large=True),
             }
             chart_methods[zoom](large_card.content)
@@ -1608,7 +1732,7 @@ class ModernApp:
             # Chart 1: 能力热力图
             c1 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
             c1.grid(row=0, column=0, sticky='nsew', padx=(0, 8), pady=(0, 8))
-            self._draw_heatmap_chart(c1.content, sorted_models, matrix)
+            self._draw_heatmap_chart(c1.content, sorted_models, matrix, current_dims)
 
             # Chart 2: 置信区间图
             c2 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
@@ -1623,12 +1747,12 @@ class ModernApp:
             # Chart 4: 排名分布图
             c4 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
             c4.grid(row=1, column=1, sticky='nsew', padx=(8, 0), pady=(8, 0))
-            self._draw_ranking_bar_chart(c4.content, sorted_models, matrix)
+            self._draw_ranking_bar_chart(c4.content, sorted_models, matrix, current_dims)
 
             # Chart 5: 开源 vs 闭源对比
             c5 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
             c5.grid(row=2, column=0, sticky='nsew', padx=(0, 8), pady=(8, 0))
-            self._draw_license_comparison(c5.content)
+            self._draw_license_comparison(c5.content, current_dims)
 
             # Chart 6: 投票热度图
             c6 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
@@ -1661,7 +1785,7 @@ class ModernApp:
 
     # ---------- heatmap sub-charts ----------
 
-    def _draw_heatmap_chart(self, parent, sorted_models, matrix, large=False):
+    def _draw_heatmap_chart(self, parent, sorted_models, matrix, dims, large=False):
         """Chart 1: 模型×维度能力热力图"""
         fs = (11, 8) if large else (5.5, 4)
         lbl_fs = 12 if large else 7
@@ -1679,12 +1803,12 @@ class ModernApp:
         ax.set_facecolor(THEME['bg_secondary'])
 
         im = ax.imshow(matrix, cmap='YlOrRd', aspect='auto')
-        ax.set_xticks(range(len(EVALUATION_DIMENSIONS)))
-        ax.set_xticklabels(EVALUATION_DIMENSIONS, rotation=45, ha='right', fontsize=lbl_fs, color=THEME['text_secondary'])
+        ax.set_xticks(range(len(dims)))
+        ax.set_xticklabels(dims, rotation=45, ha='right', fontsize=lbl_fs, color=THEME['text_secondary'])
         ax.set_yticks(range(len(sorted_models)))
         ax.set_yticklabels([m[:name_len] for m in sorted_models], fontsize=ytick_fs, color=THEME['text_secondary'])
         for i in range(len(sorted_models)):
-            for j in range(len(EVALUATION_DIMENSIONS)):
+            for j in range(len(dims)):
                 val = matrix[i, j]
                 tc = 'white' if val > np.mean(matrix) + np.std(matrix) else 'black'
                 ax.text(j, i, f'{val:.0f}', ha='center', va='center', fontsize=val_fs, color=tc)
@@ -1715,7 +1839,7 @@ class ModernApp:
         scores = [avg_scores.get(m, 0) for m in models]
         errors = []
         for m in models:
-            dims = [d.get('score', 0) for d in self.raw_data if d.get('model') == m]
+            dims = [d.get('score', 0) for d in self._get_current_arena_data() if d.get('model') == m]
             if len(dims) > 1:
                 errors.append(np.std(dims))
             else:
@@ -1727,6 +1851,67 @@ class ModernApp:
         ax.set_yticklabels([m[:name_len] for m in models], fontsize=ytick_fs, color=THEME['text_secondary'])
         ax.set_xlabel('综合得分', fontsize=xlabel_fs, color=THEME['text_secondary'])
         ax.invert_yaxis()
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        plt.close(fig)
+
+    def _draw_flagship_bar(self, parent, companies, dims):
+        """Draw horizontal bar chart for 1-2 dimensions (radar is meaningless)."""
+        if not companies:
+            return
+
+        header = tk.Frame(parent, bg=THEME['bg_secondary'])
+        header.pack(fill=tk.X, padx=16, pady=(12, 4))
+        tk.Label(header, text="旗舰模型得分对比", bg=THEME['bg_secondary'],
+                 fg=THEME['text'], font=(THEME['font_family'], 12, 'bold')).pack(side=tk.LEFT)
+
+        fig, ax = plt.subplots(figsize=(10, 7))
+        fig.patch.set_facecolor(THEME['bg_secondary'])
+        ax.set_facecolor(THEME['bg_secondary'])
+
+        labels = [f"{company} · {info['model']}" for company, info in companies]
+        colors = THEME['chart_colors']
+
+        if len(dims) <= 1:
+            dim_name = dims[0] if dims else 'Score'
+            scores = [list(info['scores'].values())[0] if info['scores'] else 0
+                      for _, info in companies]
+            bar_colors = [colors[i % len(colors)] for i in range(len(companies))]
+            y_pos = np.arange(len(companies))
+            bars = ax.barh(y_pos, scores, height=0.6, color=bar_colors, alpha=0.85)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(labels, fontsize=10, color=THEME['text_secondary'])
+            ax.set_xlabel(dim_name, fontsize=11, color=THEME['text_secondary'])
+            ax.invert_yaxis()
+            for bar, val in zip(bars, scores):
+                ax.text(val + 0.3, bar.get_y() + bar.get_height() / 2,
+                        f'{val:.1f}', va='center', fontsize=10,
+                        color=THEME['text'], fontweight='bold')
+        else:
+            x = np.arange(len(companies))
+            width = 0.35
+            for d_idx, dim_name in enumerate(dims[:2]):
+                scores = [info['scores'].get(dim_name, 0) for _, info in companies]
+                offset = (d_idx - 0.5) * width
+                bar_color = colors[d_idx % len(colors)]
+                bars = ax.barh(x + offset, scores, width, label=dim_name,
+                               color=bar_color, alpha=0.85)
+                for bar, val in zip(bars, scores):
+                    ax.text(val + 0.3, bar.get_y() + bar.get_height() / 2,
+                            f'{val:.1f}', va='center', fontsize=9,
+                            color=THEME['text'])
+            ax.set_yticks(x)
+            ax.set_yticklabels(labels, fontsize=10, color=THEME['text_secondary'])
+            ax.legend(fontsize=10, framealpha=0.8, edgecolor=THEME['border'])
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color(THEME['border'])
+        ax.spines['bottom'].set_color(THEME['border'])
+        ax.tick_params(axis='x', colors=THEME['text_muted'])
+        ax.grid(axis='x', color=THEME['border_light'], linestyle='--', linewidth=0.8)
         plt.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=parent)
         canvas.draw()
@@ -1749,7 +1934,12 @@ class ModernApp:
         tk.Label(header, text="旗舰模型能力雷达图", bg=THEME['bg_secondary'],
                  fg=THEME['text'], font=(THEME['font_family'], 12, 'bold')).pack(side=tk.LEFT)
 
-        n = len(EVALUATION_DIMENSIONS)
+        # Determine dimensions from actual data
+        dims = sorted({dim for _, info in companies for dim in info['scores']})
+        if not dims:
+            dims = EVALUATION_DIMENSIONS
+
+        n = len(dims)
         angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
         angles += angles[:1]
 
@@ -1768,7 +1958,7 @@ class ModernApp:
         colors = THEME['chart_colors']
 
         for i, (company, info) in enumerate(companies):
-            values = [info['scores'].get(dim, min_range) for dim in EVALUATION_DIMENSIONS]
+            values = [info['scores'].get(dim, min_range) for dim in dims]
             values += values[:1]
 
             color = colors[i % len(colors)]
@@ -1778,7 +1968,7 @@ class ModernApp:
             ax.fill(angles, values, alpha=0.1, color=color)
 
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(EVALUATION_DIMENSIONS, fontsize=lbl_fs, color=THEME['text_secondary'])
+        ax.set_xticklabels(dims, fontsize=lbl_fs, color=THEME['text_secondary'])
         ax.set_ylim(min_range, max_range)
 
         # Set y-axis ticks to be readable
@@ -1801,7 +1991,7 @@ class ModernApp:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         plt.close(fig)
 
-    def _draw_ranking_bar_chart(self, parent, sorted_models, matrix, large=False):
+    def _draw_ranking_bar_chart(self, parent, sorted_models, matrix, dims, large=False):
         """Chart 4: 各维度排名分布"""
         fs = (11, 8) if large else (5.5, 4)
         ytick_fs = 9 if large else 6
@@ -1821,7 +2011,7 @@ class ModernApp:
         # Average rank across dimensions for top 10 models
         top_n = min(10, len(sorted_models))
         dim_ranks = np.zeros_like(matrix[:top_n])
-        for j in range(len(EVALUATION_DIMENSIONS)):
+        for j in range(matrix.shape[1]):
             col = matrix[:top_n, j]
             order = col.argsort()[::-1]
             ranks = np.empty_like(order)
@@ -1868,7 +2058,7 @@ class ModernApp:
 
         # Collect data: average output price, rating, license for each model
         models_info = {}
-        for item in self.raw_data:
+        for item in self._get_current_arena_data():
             model = item.get('model', '')
             if model not in models_info:
                 models_info[model] = {
@@ -1933,7 +2123,7 @@ class ModernApp:
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         plt.close(fig)
 
-    def _draw_license_comparison(self, parent, large=False):
+    def _draw_license_comparison(self, parent, dims, large=False):
         """Chart 5: Open Source vs Proprietary score comparison by dimension"""
         fs = (11, 8) if large else (5.5, 4)
         lbl_fs = 10 if large else 7
@@ -1950,9 +2140,9 @@ class ModernApp:
         ax.set_facecolor(THEME['bg_secondary'])
 
         # Group models by license type
-        open_scores = {dim: [] for dim in EVALUATION_DIMENSIONS}
-        closed_scores = {dim: [] for dim in EVALUATION_DIMENSIONS}
-        for item in self.raw_data:
+        open_scores = {dim: [] for dim in dims}
+        closed_scores = {dim: [] for dim in dims}
+        for item in self._get_current_arena_data():
             dim = item.get('dimension', '')
             score = item.get('score', 0)
             license_type = item.get('license', '')
@@ -1964,11 +2154,11 @@ class ModernApp:
                 closed_scores[dim].append(score)
 
         open_avg = [sum(open_scores[d]) / len(open_scores[d]) if open_scores[d] else 0
-                    for d in EVALUATION_DIMENSIONS]
+                    for d in dims]
         closed_avg = [sum(closed_scores[d]) / len(closed_scores[d]) if closed_scores[d] else 0
-                      for d in EVALUATION_DIMENSIONS]
+                      for d in dims]
 
-        x = np.arange(len(EVALUATION_DIMENSIONS))
+        x = np.arange(len(dims))
         width = 0.35
 
         bars1 = ax.bar(x - width / 2, open_avg, width, label='Open Source',
@@ -1977,7 +2167,7 @@ class ModernApp:
                        color=THEME['chart_colors'][0], alpha=0.85)
 
         ax.set_xticks(x)
-        ax.set_xticklabels(EVALUATION_DIMENSIONS, rotation=45, ha='right',
+        ax.set_xticklabels(dims, rotation=45, ha='right',
                            fontsize=lbl_fs, color=THEME['text_secondary'])
         ax.set_ylabel('平均得分', fontsize=9 if large else 8, color=THEME['text_secondary'])
         ax.legend(fontsize=legend_fs, framealpha=0.8, edgecolor=THEME['border'])
@@ -2010,7 +2200,7 @@ class ModernApp:
 
         # Collect votes per model
         model_votes = {}
-        for item in self.raw_data:
+        for item in self._get_current_arena_data():
             model = item.get('model', '')
             votes = item.get('votes', 0)
             if model and votes:
@@ -2047,7 +2237,7 @@ class ModernApp:
 
     def _get_model_dimension_scores(self):
         model_dimensions = {}
-        for item in self.raw_data:
+        for item in self._get_current_arena_data():
             model = item.get('model', '')
             dimension = item.get('dimension', '')
             if not model or not dimension:

@@ -26,6 +26,14 @@ TIMEOUT = 30
 DIMENSIONS = ["语言理解", "逻辑推理", "知识问答", "代码生成",
               "文本生成", "数学能力", "多语言能力", "安全性"]
 
+ARENA_DIMENSION_MAP = {
+    'code': '代码生成',
+    'document': '知识问答',
+    'search': '逻辑推理',
+    'vision': '多语言能力',
+    'image-to-code': '代码生成',
+}
+
 
 def classify_model(model_name: str) -> str:
     """根据模型名称判断是国内还是国际"""
@@ -233,46 +241,21 @@ class ModelCrawler:
             resp = self.session.get("https://lmarena.ai/leaderboard", timeout=TIMEOUT)
             soup = BeautifulSoup(resp.text, 'html.parser')
 
-            # Extract rich model data from embedded Next.js RSC payload
-            entries = self._extract_entries_from_rsc(soup)
+            all_arenas = self._extract_all_arenas(soup)
 
-            if entries:
-                seen_models = set()
-                for entry in entries:
-                    raw_name = entry.get('modelDisplayName', '')
-                    formatted_name = format_model_name(raw_name)
-                    if formatted_name in seen_models:
-                        continue
-                    seen_models.add(formatted_name)
+            if all_arenas:
+                # Text-like arenas use dimension scores
+                TEXT_ARENAS = {'text', 'code', 'vision', 'document', 'search', 'image-to-code'}
+                # Image/Video arenas have no dimension breakdown
+                MEDIA_ARENAS = {'text-to-image', 'image-edit', 'text-to-video', 'image-to-video', 'video-to-video'}
 
-                    rank = entry.get('rank', 0)
-                    rating = entry.get('rating', 0)
-                    votes = entry.get('votes', 0)
-                    org = entry.get('modelOrganization', '')
-                    license_type = entry.get('license', '')
-                    input_price = entry.get('inputPricePerMillion')
-                    output_price = entry.get('outputPricePerMillion')
-                    context_len = entry.get('contextLength')
-
-                    model_data = generate_dimensions(formatted_name, rank)
-                    # Enrich each dimension record with extra fields
-                    for rec in model_data:
-                        rec['company'] = org or extract_company(formatted_name)
-                        # Use org to classify domestic/international when available
-                        org_category = classify_by_org(org) if org else None
-                        if org_category:
-                            rec['category'] = org_category
-                        rec['rating'] = rating
-                        rec['votes'] = votes
-                        rec['license'] = license_type
-                        rec['inputPricePerMillion'] = input_price
-                        rec['outputPricePerMillion'] = output_price
-                        rec['contextLength'] = context_len
-                        rec['modelUrl'] = entry.get('modelUrl', '')
-                        rec['source'] = 'LMSYS Arena'
-                    data.extend(model_data)
+                for arena_slug, entries in all_arenas.items():
+                    if arena_slug in TEXT_ARENAS:
+                        self._process_text_arena(entries, arena_slug, data)
+                    elif arena_slug in MEDIA_ARENAS:
+                        self._process_media_arena(entries, arena_slug, data)
             else:
-                # Fallback: parse HTML table (less data)
+                # Fallback: parse HTML table
                 table = soup.find('table')
                 if not table:
                     return data
@@ -291,53 +274,165 @@ class ModelCrawler:
                         except (ValueError, IndexError):
                             overall_rank = i + 1
                         model_data = generate_dimensions(formatted_name, overall_rank)
+                        for rec in model_data:
+                            rec['arena'] = 'text'
                         data.extend(model_data)
+
         except Exception as e:
             logger.debug(f"爬取失败，回退到模拟数据: {e}")
             raise CrawlerException(f"爬取失败: {e}")
         return data
 
-    def _extract_entries_from_rsc(self, soup) -> List[Dict]:
-        """Extract model entries from Next.js RSC payload in script tags."""
+    def _process_text_arena(self, entries, arena_slug, data):
+        """Process a text-type arena.
+
+        Every arena is stored independently with its own models.
+        - 'text' arena: generates 8-dimension baseline per model (original logic).
+        - Other text arenas (code, document, etc.): each model gets one record
+          with the arena's mapped dimension and rank-based score, PLUS its own
+          rating/votes/etc.  These are NOT merged into text baseline anymore —
+          each arena stands alone in the UI.
+        """
+        target_dim = ARENA_DIMENSION_MAP.get(arena_slug)
+        seen_models = set()
+        for entry in entries:
+            raw_name = entry.get('modelDisplayName', '')
+            formatted_name = format_model_name(raw_name)
+            if formatted_name in seen_models:
+                continue
+            seen_models.add(formatted_name)
+
+            rank = entry.get('rank', 0)
+            rating = entry.get('rating', 0)
+            votes = entry.get('votes', 0)
+            org = entry.get('modelOrganization', '')
+            license_type = entry.get('license', '')
+            input_price = entry.get('inputPricePerMillion')
+            output_price = entry.get('outputPricePerMillion')
+            context_len = entry.get('contextLength')
+
+            org_category = classify_by_org(org) if org else None
+            category = org_category or classify_model(formatted_name)
+            company = org or extract_company(formatted_name)
+
+            common = {
+                'company': company,
+                'category': category,
+                'rating': rating,
+                'votes': votes,
+                'license': license_type,
+                'inputPricePerMillion': input_price,
+                'outputPricePerMillion': output_price,
+                'contextLength': context_len,
+                'modelUrl': entry.get('modelUrl', ''),
+                'arena': arena_slug,
+                'source': 'LMSYS Arena',
+            }
+
+            if arena_slug == 'text':
+                model_data = generate_dimensions(formatted_name, rank)
+                for rec in model_data:
+                    rec.update(common)
+                data.extend(model_data)
+            else:
+                dim_label = target_dim or arena_slug
+                score = rank_to_score(rank) if rank else rank_to_score(50)
+                data.append({
+                    'model': formatted_name,
+                    'dimension': dim_label,
+                    'score': round(score, 2),
+                    'timestamp': datetime.now().isoformat(),
+                    **common,
+                })
+
+    def _process_media_arena(self, entries, arena_slug, data):
+        """Process an image/video arena (no dimension breakdown, just rank + rating)."""
+        for entry in entries:
+            raw_name = entry.get('modelDisplayName', '')
+            formatted_name = format_model_name(raw_name)
+            rank = entry.get('rank', 0)
+            rating = entry.get('rating', 0)
+            votes = entry.get('votes', 0)
+            org = entry.get('modelOrganization', '')
+            license_type = entry.get('license', '')
+            input_price = entry.get('inputPricePerMillion')
+            output_price = entry.get('outputPricePerMillion')
+            context_len = entry.get('contextLength')
+
+            # Use arena slug as the "dimension" for media models
+            dimension_label = {
+                'text-to-image': '文生图',
+                'image-edit': '图片编辑',
+                'text-to-video': '文生视频',
+                'image-to-video': '图生视频',
+                'video-to-video': '视频编辑',
+            }.get(arena_slug, arena_slug)
+
+            org_category = classify_by_org(org) if org else None
+            category = org_category or classify_model(formatted_name)
+
+            data.append({
+                'model': formatted_name,
+                'company': org or extract_company(formatted_name),
+                'category': category,
+                'dimension': dimension_label,
+                'score': round(rank_to_score(rank) if rank else rank_to_score(50), 2),
+                'rating': rating,
+                'votes': votes,
+                'license': license_type,
+                'inputPricePerMillion': input_price,
+                'outputPricePerMillion': output_price,
+                'contextLength': context_len,
+                'modelUrl': entry.get('modelUrl', ''),
+                'arena': arena_slug,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'LMSYS Arena',
+            })
+
+    def _extract_all_arenas(self, soup) -> Dict[str, List[Dict]]:
+        """Extract all arena leaderboards from Next.js RSC payload.
+        Returns dict mapping arena_slug -> list of model entries."""
+        result = {}
         scripts = soup.find_all('script')
         for script in scripts:
             raw = str(script)
             if 'votes' not in raw or 'contextLength' not in raw:
                 continue
-            content = script.string or ''
-            if not content:
+            script_content = script.string or ''
+            if not script_content:
                 continue
 
-            # Find 'entries' in the text arena (first occurrence)
-            idx = content.find('entries')
-            if idx < 0:
-                continue
+            positions = [m.start() for m in re.finditer(r'entries', script_content)]
+            for pos in positions:
+                # Determine arena slug
+                before = script_content[max(0, pos - 4000):pos]
+                arena_matches = re.findall(r'arenaSlug[^a-zA-Z]*([a-z\-]+)', before)
+                arena = arena_matches[-1] if arena_matches else None
+                if not arena:
+                    continue
 
-            arr_start = content.find('[', idx)
-            if arr_start < 0:
-                continue
+                arr_start = script_content.find('[', pos)
+                if arr_start < 0:
+                    continue
 
-            chunk = content[arr_start:arr_start + 500000]
-            # Unescape double-escaped quotes
-            chunk = chunk.replace('\\"', '"')
+                chunk = script_content[arr_start:arr_start + 500000]
+                chunk = chunk.replace('\\"', '"')
 
-            # Find matching closing bracket
-            depth = 0
-            end = 0
-            for j, c in enumerate(chunk):
-                if c == '[':
-                    depth += 1
-                elif c == ']':
-                    depth -= 1
-                    if depth == 0:
-                        end = j
-                        break
+                depth, end = 0, 0
+                for j, c in enumerate(chunk):
+                    if c == '[': depth += 1
+                    elif c == ']':
+                        depth -= 1
+                        if depth == 0: end = j; break
 
-            try:
-                return json.loads(chunk[:end + 1])
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return []
+                try:
+                    entries = json.loads(chunk[:end + 1])
+                    # Only keep first occurrence per arena
+                    if arena not in result and isinstance(entries, list) and entries:
+                        result[arena] = entries
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return result
 
     @safe_operation
     def crawl_with_progress(self, progress_callback=None) -> List[Dict]:
@@ -407,6 +502,7 @@ def get_simulated_data() -> List[Dict]:
                 "inputPricePerMillion": input_price,
                 "outputPricePerMillion": output_price,
                 "contextLength": context_len,
+                "arena": "text",
                 "timestamp": datetime.now().isoformat(),
                 "source": "simulated"
             })

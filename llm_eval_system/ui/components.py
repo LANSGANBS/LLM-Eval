@@ -370,6 +370,10 @@ class SidebarButton:
         self.is_active = active
         self._on_leave()
 
+    def update_text(self, new_text):
+        self.text = new_text
+        self._on_leave()
+
 
 class LoadingSpinner:
     """加载动画组件"""

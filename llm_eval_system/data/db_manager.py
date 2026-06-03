@@ -254,7 +254,7 @@ class DatabaseManager:
                 if metadata_str:
                     try:
                         metadata = json.loads(metadata_str)
-                        for key in ('company', 'rating', 'votes', 'license', 'modelUrl',
+                        for key in ('company', 'rating', 'votes', 'license', 'modelUrl', 'arena',
                                     'inputPricePerMillion', 'outputPricePerMillion',
                                     'contextLength'):
                             if key in metadata:
