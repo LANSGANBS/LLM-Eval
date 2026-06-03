@@ -1,18 +1,17 @@
 """
-真实网络爬虫模块 - 从专业AI评测网站抓取数据
+网络爬虫模块 - 从专业AI评测网站抓取数据
 """
-
 import requests
-import re
 import json
 import time
 import logging
-import threading
+import random
 from bs4 import BeautifulSoup
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from llm_eval_system.utils.exceptions import CrawlerException, safe_operation
+
 logger = logging.getLogger(__name__)
 
 HEADERS = {
@@ -23,19 +22,17 @@ HEADERS = {
 
 TIMEOUT = 30
 
-# 评测维度
-DIMENSIONS = ["语言理解", "逻辑推理", "知识问答", "代码生成", 
+DIMENSIONS = ["语言理解", "逻辑推理", "知识问答", "代码生成",
               "文本生成", "数学能力", "多语言能力", "安全性"]
 
 
 def classify_model(model_name: str) -> str:
     """根据模型名称判断是国内还是国际"""
-    domestic_keywords = ['qwen', 'kimi', 'deepseek', 'glm', 'baichuan', 'yi-', 
+    domestic_keywords = ['qwen', 'kimi', 'deepseek', 'glm', 'baichuan', 'yi-',
                         'chatglm', 'sensechat', 'spark', 'tongyi', 'doubao',
-                        'ernie', 'wenxin', 'hunyuan', 'tencent', 'mimo', 
+                        'ernie', 'wenxin', 'hunyuan', 'tencent', 'mimo',
                         'minimax', 'moonshot', 'iflytek', 'bytedance']
     name_lower = model_name.lower()
-    
     for kw in domestic_keywords:
         if kw in name_lower:
             return "domestic"
@@ -43,20 +40,15 @@ def classify_model(model_name: str) -> str:
 
 
 def format_model_name(raw_name: str) -> str:
-    """格式化模型名称 - 添加空格分隔"""
+    """格式化模型名称"""
     name = raw_name
-    
-    # 常见模型前缀格式化
     replacements = [
-        # Anthropic
         ('Anthropicclaude', 'Anthropic Claude'),
         ('anthropicclaude', 'Anthropic Claude'),
         ('claude-opus', 'Claude Opus'),
         ('claude-sonnet', 'Claude Sonnet'),
         ('claude-haiku', 'Claude Haiku'),
         ('claude-', 'Claude '),
-        
-        # OpenAI
         ('gpt-4o', 'GPT-4o'),
         ('gpt-4', 'GPT-4'),
         ('gpt-3.5', 'GPT-3.5'),
@@ -65,72 +57,43 @@ def format_model_name(raw_name: str) -> str:
         ('o1-mini', 'o1-mini'),
         ('o1-', 'o1-'),
         ('o3-', 'o3-'),
-        
-        # Google
         ('gemini-pro', 'Gemini Pro'),
         ('gemini-ultra', 'Gemini Ultra'),
         ('gemini-', 'Gemini '),
         ('gemma-', 'Gemma '),
-        
-        # Meta
         ('llama-', 'LLaMA '),
         ('muse-', 'Muse '),
-        
-        # Mistral
         ('mistral-', 'Mistral '),
         ('mixtral-', 'Mixtral '),
-        
-        # xAI
         ('grok-', 'Grok '),
-        
-        # 阿里
         ('qwen-', 'Qwen '),
         ('tongyi-', 'Tongyi '),
-        
-        # 深度求索
         ('deepseek-', 'DeepSeek '),
-        
-        # 智谱
         ('chatglm', 'ChatGLM'),
         ('glm-', 'GLM-'),
-        
-        # 百度
         ('ernie-', 'Ernie '),
-        
-        # 讯飞
         ('spark-prover', 'SPARK-Prover'),
         ('spark-formalizer', 'SPARK-Formalizer'),
         ('spark-vl', 'SPARK-VL'),
-        
-        # 商汤
         ('sensechat-', 'SenseChat '),
-        
-        # 小米
         ('mimo-', 'MiMo '),
-        
-        # Amazon
         ('amazon-nova', 'Amazon Nova'),
         ('nova-pro', 'Nova Pro'),
         ('nova-lite', 'Nova Lite'),
         ('nova-micro', 'Nova Micro'),
         ('titan-', 'Titan '),
-        
-        # 通用
         ('-thinking', ' (thinking)'),
     ]
-    
     for old, new in replacements:
         name = name.replace(old, new)
-    
     return name
 
 
 def extract_company(model_name: str) -> str:
-    """提取公司信息 - 有序列表匹配，优先具体规则"""
+    """提取公司信息"""
     name_lower = model_name.lower()
-    
     priority_rules = [
-        ('gpt4all', 'GPT4All'),
+        ('gpt4all', 'GPT4all'),
         ('gpt-4o', 'OpenAI'),
         ('gpt-4', 'OpenAI'),
         ('gpt-3.5', 'OpenAI'),
@@ -173,74 +136,47 @@ def extract_company(model_name: str) -> str:
         ('sensechat', '商汤科技'),
         ('iflytek', '科大讯飞'),
         ('iflytek-spark', '科大讯飞'),
-        ('spark-prover', '科大讯飞'),
-        ('spark-formalizer', '科大讯飞'),
-        ('mimo', '小米'),
-        ('mi-', '小米'),
+        ('spark', '科大讯飞'),
         ('minimax', 'MiniMax'),
         ('moonshot', '月之暗面'),
     ]
-    
-    for key, company in priority_rules:
-        if key in name_lower:
+    for keyword, company in priority_rules:
+        if keyword in name_lower:
             return company
-    
     return "未知"
 
 
 def rank_to_score(rank: int) -> float:
-    """将排名转换为分数 - 拉大差距"""
+    """根据排名转换为分数"""
     if rank <= 10:
-        # 前10名: 90-100分
-        return 100 - (rank - 1) * 1.0
+        return 95.0 - (rank - 1) * 0.5
     elif rank <= 50:
-        # 11-50名: 80-90分
-        return 90 - (rank - 10) * 0.25
+        return 90.0 - (rank - 10) * 0.3
     elif rank <= 100:
-        # 51-100名: 70-80分
-        return 80 - (rank - 50) * 0.2
-    elif rank <= 200:
-        # 101-200名: 60-70分
-        return 70 - (rank - 100) * 0.1
-    elif rank <= 400:
-        # 201-400名: 40-60分
-        return 60 - (rank - 200) * 0.1
+        return 78.0 - (rank - 50) * 0.2
     else:
-        # 400名以后: 20-40分
-        return max(20, 40 - (rank - 400) * 0.05)
+        return 68.0 - (rank - 100) * 0.05
 
 
-def generate_dimensions(model_name: str, rank: int) -> List[Dict]:
-    """为模型生成8个维度的评分"""
-    import random
-    random.seed(hash(model_name) % 10000)
-    
-    # 基于排名计算基础分数
-    base_score = rank_to_score(rank)
-    
-    # 基于模型名称生成一致的维度分数
-    dimensions = ["语言理解", "逻辑推理", "知识问答", "代码生成", 
-                  "文本生成", "数学能力", "多语言能力", "安全性"]
-    
+def generate_dimensions(model_name: str, overall_rank: int) -> List[Dict]:
+    """生成各维度数据"""
+    base_score = rank_to_score(overall_rank)
+    random.seed(hash(model_name) + 42)
+
     data = []
-    for dim in dimensions:
-        # 不同维度的基准调整 - 根据排名调整幅度
-        if rank <= 10:
-            # 顶级模型各维度都比较均衡
-            adjustment = random.uniform(-1, 2)
-        elif rank <= 50:
-            adjustment = random.uniform(-3, 3)
-        elif rank <= 100:
-            adjustment = random.uniform(-5, 3)
-        elif rank <= 200:
-            adjustment = random.uniform(-8, 2)
+    for dim in DIMENSIONS:
+        if dim == "数学能力":
+            adj = random.uniform(-5, 3)
+        elif dim == "代码生成":
+            adj = random.uniform(-4, 4)
+        elif dim == "多语言能力":
+            adj = random.uniform(-3, 2)
+        elif dim == "安全性":
+            adj = random.uniform(-2, 5)
         else:
-            # 排名靠后的模型在某些维度上可能明显较弱
-            adjustment = random.uniform(-10, 2)
-        
-        score = base_score + adjustment
-        score = max(10, min(100, score))
-        
+            adj = random.uniform(-3, 3)
+        score = max(60, min(100, base_score + adj))
+
         data.append({
             "model": model_name,
             "company": extract_company(model_name),
@@ -250,63 +186,81 @@ def generate_dimensions(model_name: str, rank: int) -> List[Dict]:
             "timestamp": datetime.now().isoformat(),
             "source": "LMSYS Arena"
         })
-    
     return data
 
 
-def crawl_lmarena() -> List[Dict]:
-    """爬取 LMSYS Arena 排行榜"""
-    data = []
-    try:
-        logger.info("正在爬取 LMSYS Arena 排行榜...")
-        resp = requests.get("https://lmarena.ai/leaderboard", headers=HEADERS, timeout=TIMEOUT)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        table = soup.find('table')
-        if not table:
-            logger.warning("未找到排行榜表格")
+class ModelCrawler:
+    """模型爬虫类"""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.data = []
+
+    @safe_operation
+    def crawl_lmarena(self) -> List[Dict]:
+        data = []
+        try:
+            resp = self.session.get("https://lmarena.ai/leaderboard", timeout=TIMEOUT)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            table = soup.find('table')
+            if not table:
+                return data
+
+            rows = table.find_all('tr')[1:]
+            seen_models = set()
+            for i, row in enumerate(rows):
+                cells = row.find_all(['td', 'th'])
+                if len(cells) >= 3:
+                    raw_name = cells[0].get_text(strip=True)
+                    formatted_name = format_model_name(raw_name)
+                    if formatted_name in seen_models:
+                        continue
+                    seen_models.add(formatted_name)
+                    try:
+                        overall_rank = int(cells[1].get_text(strip=True))
+                    except (ValueError, IndexError):
+                        overall_rank = i + 1
+                    model_data = generate_dimensions(formatted_name, overall_rank)
+                    data.extend(model_data)
+        except Exception as e:
+            logger.debug(f"爬取失败，回退到模拟数据: {e}")
+            raise CrawlerException(f"爬取失败: {e}")
+        return data
+
+    @safe_operation
+    def crawl_with_progress(self, progress_callback=None) -> List[Dict]:
+        if progress_callback:
+            progress_callback(0, "开始爬取...")
+        try:
+            if progress_callback:
+                progress_callback(30, "正在连接...")
+            data = self.crawl_lmarena()
+            if progress_callback:
+                progress_callback(100, f"完成，共{len(data)}条")
             return data
-        
-        rows = table.find_all('tr')[1:]  # 跳过表头
-        logger.info(f"找到 {len(rows)} 个模型")
-        
-        seen_models = set()  # 去重
-        for i, row in enumerate(rows):
-            cells = row.find_all(['td', 'th'])
-            if len(cells) >= 3:
-                raw_name = cells[0].get_text(strip=True)
-                
-                # 格式化模型名称
-                formatted_name = format_model_name(raw_name)
-                
-                # 去重
-                if formatted_name in seen_models:
-                    continue
-                seen_models.add(formatted_name)
-                
-                # 提取分数 (排名转分数)
-                try:
-                    overall_rank = int(cells[1].get_text(strip=True))
-                    score = max(50, 100 - overall_rank * 0.08)
-                except (ValueError, IndexError):
-                    score = 85.0
-                
-                # 为每个模型生成8个维度的数据
-                model_data = generate_dimensions(formatted_name, i + 1)
-                data.extend(model_data)
-        
-        logger.info(f"成功爬取 {len(data)} 条数据")
-    except Exception as e:
-        logger.error(f"爬取 LMSYS Arena 失败: {e}")
-    
-    return data
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0, f"失败: {e}")
+            raise
+
+
+def get_latest_models() -> List[Dict]:
+    """获取最新模型数据 - 优先使用爬虫，失败时返回模拟数据"""
+    crawler = ModelCrawler()
+    try:
+        data = crawler.crawl_lmarena()
+        if data:
+            return data
+    except Exception:
+        pass
+    return get_simulated_data()
 
 
 def get_simulated_data() -> List[Dict]:
     """生成模拟数据"""
-    import random
     random.seed(42)
-    
+
     models = [
         ("DeepSeek-V3", "深度求索", "domestic", 92.5),
         ("通义千问2.5", "阿里巴巴", "domestic", 89.8),
@@ -324,7 +278,7 @@ def get_simulated_data() -> List[Dict]:
         ("Mistral Large", "Mistral AI", "international", 87.6),
         ("Grok 2", "xAI", "international", 85.8),
     ]
-    
+
     data = []
     for model_name, company, category, base in models:
         for dim in DIMENSIONS:
@@ -338,18 +292,4 @@ def get_simulated_data() -> List[Dict]:
                 "timestamp": datetime.now().isoformat(),
                 "source": "simulated"
             })
-    
-    return data
-
-
-def get_latest_models() -> List[Dict]:
-    """获取最新模型数据"""
-    logger.info("开始获取最新模型数据...")
-    
-    data = crawl_lmarena()
-    
-    if not data:
-        logger.warning("网络爬取失败，返回模拟数据")
-        return get_simulated_data()
-    
     return data
