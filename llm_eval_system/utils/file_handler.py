@@ -65,14 +65,26 @@ class FileHandler:
             return json.load(f)
     
     def export_to_csv(self, data, file_path):
-        """导出数据到CSV"""
+        """导出数据到CSV。
+
+        各条记录字段可能不一致（媒体领域缺价格/上下文等），因此汇总所有
+        出现过的字段作为表头，并对缺失字段用 extrasaction='ignore' 容错。
+        """
         if not data:
             return
-        keys = data[0].keys()
+        # 汇总全部字段，保持首条出现顺序，再补充其余字段
+        keys = list(data[0].keys())
+        seen = set(keys)
+        for row in data:
+            for k in row.keys():
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
         with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
             writer.writeheader()
-            writer.writerows(data)
+            for row in data:
+                writer.writerow({k: row.get(k, '') for k in keys})
         logger.debug(f"数据已导出: {file_path}")
     
     def export_to_json(self, data, file_path):

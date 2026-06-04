@@ -33,12 +33,16 @@ class DatabaseManager:
         return cls._instance
     
     def __init__(self, db_path: str = None):
+        # 双重检查加锁，避免多线程并发初始化数据库
         if self._initialized:
             return
-        self.db_path = db_path or DATABASE_PATH
-        self._local = threading.local()
-        self._init_database()
-        self._initialized = True
+        with self._lock:
+            if self._initialized:
+                return
+            self.db_path = db_path or DATABASE_PATH
+            self._local = threading.local()
+            self._init_database()
+            self._initialized = True
     
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程本地连接"""
@@ -106,7 +110,20 @@ class DatabaseManager:
                     crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
+            # 扁平 arena 记录表 —— 每条 = 一个 (model, arena, dimension) 完整记录。
+            # 用整条 JSON 存储，彻底解决「同一模型跨多个 arena 时字段互相覆盖」的问题。
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS arena_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model TEXT NOT NULL,
+                    arena TEXT NOT NULL,
+                    dimension TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             conn.commit()
             logger.debug("数据库初始化完成")
             
@@ -265,6 +282,63 @@ class DatabaseManager:
             return result
         except sqlite3.Error as e:
             logger.error(f"加载数据库数据失败: {e}")
+            return []
+
+    def save_records(self, records: List[Dict]) -> bool:
+        """原子地保存全部 arena 记录。
+
+        采用单事务 DELETE + 批量 INSERT：要么整体成功，要么回滚保持旧数据，
+        避免「清空后插入失败 → 数据库残缺」。返回是否成功。
+        """
+        if not records:
+            return False
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('BEGIN')
+            cursor.execute('DELETE FROM arena_records')
+            rows = []
+            for item in records:
+                model = item.get('model') or ''
+                arena = item.get('arena') or 'text'
+                dimension = item.get('dimension') or ''
+                if not model or not dimension:
+                    continue
+                rows.append((model, arena, dimension,
+                             json.dumps(item, ensure_ascii=False)))
+            if not rows:
+                conn.rollback()
+                return False
+            cursor.executemany(
+                'INSERT INTO arena_records (model, arena, dimension, payload) '
+                'VALUES (?, ?, ?, ?)', rows)
+            conn.commit()
+            logger.debug(f"已保存 {len(rows)} 条 arena 记录")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"保存 arena 记录失败，已回滚: {e}")
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+
+    def load_records(self) -> List[Dict]:
+        """从扁平表加载全部 arena 记录，返回与抓取一致的 list[dict]。"""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('SELECT payload FROM arena_records')
+            rows = cursor.fetchall()
+            result = []
+            for row in rows:
+                try:
+                    result.append(json.loads(row['payload']))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            return result
+        except sqlite3.Error as e:
+            logger.error(f"加载 arena 记录失败: {e}")
             return []
 
     @handle_exception

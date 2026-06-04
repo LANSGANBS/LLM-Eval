@@ -451,15 +451,45 @@ class ModelCrawler:
             raise
 
 
+# 完整性校验：合格的抓取结果至少应覆盖这些核心领域，且综合领域有足够模型
+_REQUIRED_ARENAS = {'text', 'code'}
+_MIN_TEXT_MODELS = 50
+
+
+def _is_complete(data: List[Dict]) -> bool:
+    """判断抓取结果是否「足够完整」，避免用残缺数据覆盖好数据。"""
+    if not data:
+        return False
+    arena_models = {}
+    for d in data:
+        arena = d.get('arena', 'text') or 'text'
+        arena_models.setdefault(arena, set()).add(d.get('model'))
+    # 必备领域都要有数据
+    for req in _REQUIRED_ARENAS:
+        if not arena_models.get(req):
+            logger.warning(f"抓取结果缺少核心领域: {req}")
+            return False
+    # 综合领域模型数要够
+    if len(arena_models.get('text', set())) < _MIN_TEXT_MODELS:
+        logger.warning("综合领域模型数过少，判定为残缺数据")
+        return False
+    return True
+
+
 def get_latest_models(minimum_rows: int = 1, fallback_to_simulated: bool = True) -> List[Dict]:
-    """获取最新模型数据 - 优先使用爬虫，失败时返回模拟数据"""
+    """获取最新模型数据 - 优先使用爬虫，失败/残缺时返回模拟数据。
+
+    增加完整性校验：抓取结果必须覆盖核心领域且综合领域模型数达标，
+    否则视为抓取失败（残缺），不返回，以免覆盖本地好数据。
+    """
     crawler = ModelCrawler()
     try:
         data = crawler.crawl_lmarena()
-        if data and len(data) >= minimum_rows:
+        if data and len(data) >= minimum_rows and _is_complete(data):
             return data
-    except Exception:
-        pass
+        logger.warning("抓取数据未通过完整性校验")
+    except Exception as e:
+        logger.warning(f"抓取异常: {e}")
     return get_simulated_data() if fallback_to_simulated else []
 
 

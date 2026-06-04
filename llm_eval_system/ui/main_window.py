@@ -37,6 +37,10 @@ from llm_eval_system.ui.components import (
     LoadingSpinner,
     ToastNotification,
     RoundedCard,
+    StatCard,
+    Badge,
+    RoundedDropdown,
+    draw_rounded_rect,
 )
 from llm_eval_system.ui.icons import get_icon
 
@@ -49,6 +53,12 @@ logger.setLevel(logging.ERROR)
 matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'STHeiti',
     'Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
+# 性能：适度降低 dpi、关闭自动布局开销、统一字号
+matplotlib.rcParams['figure.dpi'] = 90
+matplotlib.rcParams['figure.autolayout'] = False
+matplotlib.rcParams['path.simplify'] = True
+matplotlib.rcParams['path.simplify_threshold'] = 0.8
+matplotlib.rcParams['agg.path.chunksize'] = 10000
 
 TEXT_ARENA_SET = {'text', 'code', 'vision', 'document', 'search', 'image-to-code', ''}
 IMAGE_ARENA_SET = {'text-to-image', 'image-edit'}
@@ -124,6 +134,8 @@ class ModernApp:
         self.raw_data = []
         self.filtered_data = []
         self.models = []
+        self.data_origin = None
+        self.data_loaded_at = None
         self.current_tab = 'ranking'
         self.current_arena = 'text'
         self._arena_data = {}
@@ -151,6 +163,9 @@ class ModernApp:
         self._loading_frame = None
         self._loading_spinner = None
 
+        self._toast = ToastNotification(self.root)
+        self._chart_cache = {}  # 图表渲染缓存（性能优化）
+
         self._setup_styles()
         self._build_ui()
         self._load_data_async()
@@ -162,17 +177,23 @@ class ModernApp:
         style.configure('Custom.Treeview',
                         background=THEME['bg_secondary'],
                         foreground=THEME['text'],
-                        rowheight=40,
+                        rowheight=42,
                         font=(THEME['font_family'], 11),
+                        borderwidth=0,
+                        relief='flat',
                         fieldbackground=THEME['bg_secondary'])
         style.configure('Custom.Treeview.Heading',
-                        background=THEME['bg_tertiary'],
-                        foreground=THEME['text'],
+                        background=THEME['acrylic_tint'],
+                        foreground=THEME['text_secondary'],
                         font=(THEME['font_family'], 11, 'bold'),
-                        padding=10)
+                        relief='flat',
+                        borderwidth=0,
+                        padding=12)
         style.map('Custom.Treeview',
                   background=[('selected', THEME['primary_light'])],
                   foreground=[('selected', THEME['primary'])])
+        style.map('Custom.Treeview.Heading',
+                  background=[('active', THEME['bg_active'])])
 
         style.configure('Modern.Vertical.TScrollbar',
                 background=THEME['primary_light'],
@@ -198,7 +219,7 @@ class ModernApp:
                 arrowcolor=THEME['text_secondary'],
                 relief='flat',
                 borderwidth=1,
-                padding=(10, 7, 34, 7),
+                padding=(12, 8, 32, 8),
                 insertcolor=THEME['primary'])
         style.map('Modern.TCombobox',
               fieldbackground=[('readonly', THEME['bg_secondary'])],
@@ -210,18 +231,19 @@ class ModernApp:
 
         style.configure('Modern.TEntry',
                 foreground=THEME['text'],
-                fieldbackground=THEME['bg_tertiary'],
-                background=THEME['bg_tertiary'],
-                bordercolor=THEME['border'],
-                lightcolor=THEME['border'],
-                darkcolor=THEME['border'],
+                fieldbackground=THEME['bg_secondary'],
+                background=THEME['bg_secondary'],
+                bordercolor=THEME['bg_secondary'],
+                lightcolor=THEME['bg_secondary'],
+                darkcolor=THEME['bg_secondary'],
                 relief='flat',
                 borderwidth=0,
-                padding=(6, 7))
+                padding=(4, 6))
         style.map('Modern.TEntry',
-              bordercolor=[('focus', THEME['border_focus'])],
-              lightcolor=[('focus', THEME['border_focus'])],
-              darkcolor=[('focus', THEME['border_focus'])])
+              fieldbackground=[('focus', THEME['bg_secondary'])],
+              bordercolor=[('focus', THEME['bg_secondary'])],
+              lightcolor=[('focus', THEME['bg_secondary'])],
+              darkcolor=[('focus', THEME['bg_secondary'])])
 
         self.root.option_add('*TCombobox*Listbox.background', THEME['bg_secondary'])
         self.root.option_add('*TCombobox*Listbox.foreground', THEME['text'])
@@ -236,13 +258,13 @@ class ModernApp:
         # Sidebar with scrollbar support
         self.sidebar_outer = tk.Frame(main_frame, bg=THEME['bg_secondary'],
                           highlightbackground=THEME['border'],
-                          highlightthickness=1, width=260)
+                          highlightthickness=1, width=272)
         self.sidebar_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
         self.sidebar_outer.pack_propagate(False)
 
         # Canvas + scrollbar for sidebar scrolling
         self._sidebar_canvas = tk.Canvas(self.sidebar_outer, bg=THEME['bg_secondary'],
-                                          highlightthickness=0, width=280)
+                                          highlightthickness=0, width=272)
         sidebar_scroll = ttk.Scrollbar(self.sidebar_outer, orient=tk.VERTICAL,
                         style='Modern.Vertical.TScrollbar',
                         command=self._sidebar_canvas.yview)
@@ -273,41 +295,52 @@ class ModernApp:
         self._build_content()
 
     def _build_header(self):
-        header = tk.Frame(self.root, bg=THEME['bg_secondary'], height=64)
+        header = tk.Frame(self.root, bg=THEME['bg_secondary'], height=68)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
+
+        # 底部细描边，与内容区分隔
+        tk.Frame(self.root, bg=THEME['border'], height=1).pack(fill=tk.X)
 
         logo_frame = tk.Frame(header, bg=THEME['bg_secondary'])
         logo_frame.pack(side=tk.LEFT, padx=24)
 
-        # Robot icon instead of emoji
-        icon_img = get_icon('robot', size=28, color=THEME['primary'])
+        # logo 圆角底片
+        chip = tk.Canvas(logo_frame, width=40, height=40, bg=THEME['bg_secondary'],
+                         highlightthickness=0, bd=0)
+        chip.pack(side=tk.LEFT, padx=(0, 12), pady=14)
+        draw_rounded_rect(chip, 1, 1, 39, 39, 12, fill=THEME['primary_light'], outline='')
+        icon_img = get_icon('robot', size=24, color=THEME['primary'])
         self._logo_photo = ImageTk.PhotoImage(icon_img)
-        logo_label = tk.Label(logo_frame, image=self._logo_photo,
-                              bg=THEME['bg_secondary'])
-        logo_label.pack(side=tk.LEFT, padx=(0, 10))
+        chip.create_image(20, 20, image=self._logo_photo)
 
-        tk.Label(logo_frame, text="LLM评测分析系统", bg=THEME['bg_secondary'],
-                 fg=THEME['text'], font=(THEME['font_family'], 16, 'bold')).pack(side=tk.LEFT)
+        title_col = tk.Frame(logo_frame, bg=THEME['bg_secondary'])
+        title_col.pack(side=tk.LEFT)
+        tk.Label(title_col, text="LLM 评测分析系统", bg=THEME['bg_secondary'],
+                 fg=THEME['text'], font=(THEME['font_family'], 16, 'bold')).pack(anchor='w')
+        self._header_status = tk.Label(title_col, text="正在加载数据…",
+                                       bg=THEME['bg_secondary'], fg=THEME['text_muted'],
+                                       font=(THEME['font_family'], 10))
+        self._header_status.pack(anchor='w')
 
-        # Right action buttons
+        # Right action buttons - 统一尺寸
         btn_frame = tk.Frame(header, bg=THEME['bg_secondary'])
         btn_frame.pack(side=tk.RIGHT, padx=24)
 
         self._refresh_btn = StyledButton(btn_frame, "刷新数据", self._refresh_data,
-                                          icon_name='refresh', color_key='secondary',
-                                          text_color=THEME['text_secondary'], font_size=10)
-        self._refresh_btn.pack(side=tk.RIGHT, padx=(8, 0))
-
-        self._upload_btn = StyledButton(btn_frame, "上传", self._upload_file,
-                                         icon_name='upload', color_key='secondary',
-                                         text_color=THEME['text_secondary'], font_size=10)
-        self._upload_btn.pack(side=tk.RIGHT, padx=(8, 0))
+                                          icon_name='refresh', color_key='primary',
+                                          font_size=11)
+        self._refresh_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
         self._export_btn = StyledButton(btn_frame, "导出", self._export_data,
-                                         icon_name='download', color_key='secondary',
-                                         text_color=THEME['text_secondary'], font_size=10)
-        self._export_btn.pack(side=tk.RIGHT, padx=(8, 0))
+                                        icon_name='download', color_key='secondary',
+                                        font_size=11)
+        self._export_btn.pack(side=tk.RIGHT, padx=(10, 0))
+
+        self._upload_btn = StyledButton(btn_frame, "上传", self._upload_file,
+                                        icon_name='upload', color_key='secondary',
+                                        font_size=11)
+        self._upload_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
     def _build_sidebar(self):
         """构建侧边栏 - 可滚动"""
@@ -319,11 +352,10 @@ class ModernApp:
 
         arena_names = [label for label, _ in ARENA_CHOICES]
         self.arena_var = tk.StringVar(value='综合领域')
-        arena_combo = ttk.Combobox(self.sidebar, textvariable=self.arena_var,
-                                   values=arena_names, state='readonly', width=18,
-                                   style='Modern.TCombobox')
-        arena_combo.pack(fill=tk.X, padx=16, pady=(0, 4))
-        arena_combo.bind('<<ComboboxSelected>>', self._on_arena_changed)
+        arena_dd = RoundedDropdown(self.sidebar, self.arena_var, arena_names, width_px=240)
+        arena_dd.pack(fill=tk.X, padx=16, pady=(0, 4))
+        # 用变量 trace 替代 ComboboxSelected 事件
+        self.arena_var.trace_add('write', lambda *a: self._on_arena_changed())
 
         # Navigation section
         nav_label = tk.Label(self.sidebar, text="导航", bg=THEME['bg_secondary'],
@@ -357,25 +389,36 @@ class ModernApp:
                                    anchor='w')
         overview_label.pack(fill=tk.X, padx=16, pady=(0, 8))
 
+        # 关键指标用横向统计卡单列展示（侧栏较窄，单列可保证标签/数字均完整）
+        stat_col = tk.Frame(self.sidebar, bg=THEME['bg_secondary'])
+        stat_col.pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        self._stat_cards = {}
+        card_defs = [
+            ('model_count', '模型总数', '0', THEME['primary']),
+            ('avg_score', '平均分数', '0', THEME['success']),
+            ('domestic', '国内模型', '0', THEME['warning']),
+            ('international', '国际模型', '0', THEME['info']),
+        ]
+        for key, label_text, default_val, accent in card_defs:
+            sc = StatCard(stat_col, label_text, default_val, accent=accent, horizontal=True)
+            sc.pack(fill=tk.X, pady=4)
+            self._stat_cards[key] = sc
+
+        # 文本型次要指标
         self._stat_labels = {}
-        stats_data = [
-            ('model_count', '模型总数', '0'),
+        text_stats = [
             ('eval_count', '评测数据', '0'),
-            ('domestic', '国内模型', '0'),
-            ('international', '国际模型', '0'),
-            ('avg_score', '平均分数', '0'),
             ('top_model', '最高分模型', '-'),
             ('top_score', '最高分', '0'),
             ('dimensions', '评测维度', str(len(EVALUATION_DIMENSIONS))),
         ]
-        for key, label_text, default_val in stats_data:
+        for key, label_text, default_val in text_stats:
             frame = tk.Frame(self.sidebar, bg=THEME['bg_secondary'])
             frame.pack(fill=tk.X, padx=16, pady=3)
-
             tk.Label(frame, text=label_text, bg=THEME['bg_secondary'],
                      fg=THEME['text_muted'], font=(THEME['font_family'], 10),
                      anchor='w').pack(side=tk.LEFT)
-
             val_label = tk.Label(frame, text=default_val, bg=THEME['bg_secondary'],
                                  fg=THEME['text'], font=(THEME['font_family'], 10, 'bold'),
                                  anchor='e')
@@ -432,56 +475,102 @@ class ModernApp:
         return left <= x_root <= right and top <= y_root <= bottom
 
     def _install_scroll_handler(self):
-        """Install a single root-level scroll handler that dispatches
-        based on cursor position.  Replaces the old dual-bind_all approach."""
+        """安装滚轮处理。
+
+        除了 bind_all 兜底外，更关键的是：直接给「内容区」与「侧边栏」两棵
+        widget 子树递归绑定滚轮事件（在每次渲染后刷新绑定）。
+        这样无论鼠标悬停在哪个子组件（卡片 / 图表 / 标签）上，事件都会被
+        该组件的 binding 直接捕获并滚动它所属的容器 —— 这才是「指针在哪个
+        区域就滚哪个区域」的可靠做法，不依赖 bind_all 的脆弱传播。
+        """
+        # bind_all 兜底（处理未被递归绑定到的空白区域）
         for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
-            self.root.bind(seq, self._root_mousewheel, add='+')
+            self.root.bind_all(seq, self._root_mousewheel, add='+')
+
+    def _scroll_content(self, event):
+        """滚动主内容区；若鼠标恰在 Treeview 上则优先滚 Treeview。"""
+        units = self._delta_to_units(event)
+        if units == 0:
+            return 'break'
+        w = getattr(event, 'widget', None)
+        try:
+            if w is not None and w.winfo_class() == 'Treeview':
+                if self._try_scroll_treeview(w, units):
+                    return 'break'
+        except Exception:
+            pass
+        self._try_scroll_canvas(self._content_canvas, units)
+        return 'break'
+
+    def _scroll_sidebar(self, event):
+        """滚动侧边栏。"""
+        units = self._delta_to_units(event)
+        if units == 0:
+            return 'break'
+        self._try_scroll_canvas(self._sidebar_canvas, units)
+        return 'break'
+
+    def _bind_scroll_tree(self, widget, handler):
+        """给 widget 及其所有后代递归绑定滚轮事件到指定 handler。"""
+        for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+            widget.bind(seq, handler, add='+')
+        for child in widget.winfo_children():
+            self._bind_scroll_tree(child, handler)
+
+    def _refresh_content_scroll_bindings(self):
+        """内容渲染后调用：把内容区整棵子树绑定到内容滚动。"""
+        if self.content_container and self.content_container.winfo_exists():
+            self._bind_scroll_tree(self.content_container, self._scroll_content)
 
     def _root_mousewheel(self, event):
-        """Single scroll handler: check cursor position, scroll the
-        correct canvas, bubble to outer canvas on boundary."""
-        x = self.root.winfo_pointerx()
-        y = self.root.winfo_pointery()
+        """bind_all 兜底：按光标位置滚动正确的容器（处理空白/未绑定区域）。"""
         units = self._delta_to_units(event)
         if units == 0:
             return None
 
-        # If cursor is over a Treeview, let it scroll itself
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+
         hovered = self.root.winfo_containing(x, y)
         if hovered is not None:
-            cls = hovered.winfo_class()
+            try:
+                cls = hovered.winfo_class()
+            except Exception:
+                cls = ''
             if cls == 'Treeview':
-                return self._try_scroll_treeview(hovered, units)
+                if self._try_scroll_treeview(hovered, units):
+                    return 'break'
+                if self._try_scroll_canvas(self._content_canvas, units):
+                    return 'break'
+                return 'break'
             if cls in ('TCombobox', 'Listbox', 'Text'):
                 return None
 
-        # Try sidebar first, then content (bubble on boundary)
         if self._widget_contains_point(self.sidebar_outer, x, y):
-            if self._try_scroll_canvas(self._sidebar_canvas, units):
-                return 'break'
-            return None
+            self._try_scroll_canvas(self._sidebar_canvas, units)
+            return 'break'
 
         if self._widget_contains_point(self.content_outer, x, y):
-            if self._try_scroll_canvas(self._content_canvas, units):
-                return 'break'
-            return None
+            self._try_scroll_canvas(self._content_canvas, units)
+            return 'break'
 
         return None
 
     def _delta_to_units(self, event):
-        """Convert wheel event to scroll units (macOS trackpad aware)."""
+        """把滚轮事件转换为滚动单位（兼容 macOS 触摸板的小步长）。"""
         delta = getattr(event, 'delta', 0)
         if delta == 0 and getattr(event, 'num', None) in (4, 5):
             return -3 if event.num == 4 else 3
         if delta == 0:
             return 0
-        # macOS trackpad sends small values (1, -3, etc.)
+        # macOS 触摸板发送小数值 (1, -3, ...)，Windows/X11 是 120 的倍数
         if abs(delta) < 120:
-            return int(-delta * 0.5) or (-1 if delta > 0 else 1)
+            step = int(-delta)
+            return step if step != 0 else (-1 if delta > 0 else 1)
         return int(-delta / 120) * 3
 
     def _try_scroll_canvas(self, canvas, units):
-        """Try scrolling a canvas. Return True if scrolled (not at boundary)."""
+        """尝试滚动 canvas，已滚动返回 True，无可滚内容/到边界返回 False。"""
         if not canvas or not canvas.winfo_exists():
             return False
         bbox = canvas.bbox('all')
@@ -499,18 +588,17 @@ class ModernApp:
         return True
 
     def _try_scroll_treeview(self, tree, units):
+        """尝试滚动 Treeview，已滚动返回 True。"""
         try:
             start, end = tree.yview()
         except Exception:
-            return None
-        if start <= 0.0 and end >= 1.0:
-            return None
+            return False
         if units < 0 and start <= 0.0:
-            return None
+            return False
         if units > 0 and end >= 1.0:
-            return None
+            return False
         tree.yview_scroll(units, 'units')
-        return 'break'
+        return True
 
     def _create_card(self, parent, padding=(18, 16), min_height=None):
         card = RoundedCard(parent, padding=padding, min_height=min_height)
@@ -546,8 +634,12 @@ class ModernApp:
 
         # Single root-level scroll handler installed below
         self._install_scroll_handler()
+        # 侧边栏整棵子树绑定到侧栏滚动
+        if hasattr(self, 'sidebar') and self.sidebar:
+            self._bind_scroll_tree(self.sidebar, self._scroll_sidebar)
 
         self._show_ranking()
+        self.root.after_idle(self._refresh_content_scroll_bindings)
 
     # ==================== Tab switching ====================
 
@@ -576,53 +668,60 @@ class ModernApp:
             tab_map.get(tab_id, self._show_ranking)()
             if self._content_canvas and self._content_canvas.winfo_exists():
                 self.root.after_idle(lambda: self._content_canvas.yview_moveto(0))
+            # 渲染后给整棵内容子树递归绑定滚轮（含延迟渲染的图表）
+            self.root.after_idle(self._refresh_content_scroll_bindings)
+            self.root.after(120, self._refresh_content_scroll_bindings)
         finally:
             self._render_pending = False
 
     # ==================== Data loading ====================
 
-    def _load_data_async(self):
-        """Load data: DB first (instant), then crawl in background for fresh data."""
-        # Step 1: Try loading from local DB (instant)
-        try:
-            db_data = self.db.load_all_data()
-            if db_data and len(db_data) >= 50:
-                self.root.after(0, lambda: self._on_data_loaded(db_data, origin='database'))
-                # Step 2: Crawl fresh data in background, update when ready
-                def _refresh():
-                    try:
-                        crawled = get_latest_models(minimum_rows=100, fallback_to_simulated=False)
-                        if len(crawled) >= 100:
-                            self.root.after(0, lambda: self._on_data_loaded(crawled, origin='crawler'))
-                    except Exception:
-                        pass
-                threading.Thread(target=_refresh, daemon=True).start()
-                return
-        except Exception:
-            pass
+    # 本地数据有效的最小行数阈值
+    _MIN_LOCAL_ROWS = 50
+    _MIN_CRAWL_ROWS = 100
 
-        # Step 3: No DB data — crawl
+    def _load_data_async(self):
+        """启动加载策略：
+        1) 本地有数据 → 直接读本地并分析（不自动后台覆盖，避免闪烁/误判）。
+        2) 本地无数据 → 自动抓取；抓取成功用抓取数据。
+        3) 抓取也失败 → 使用写死的模拟数据。
+        """
+        # Step 1: 优先读本地（使用新的扁平表，保留完整 arena 字段）
+        db_data = None
+        try:
+            db_data = self.db.load_records()
+        except Exception:
+            db_data = None
+
+        if db_data and len(db_data) >= self._MIN_LOCAL_ROWS:
+            self._on_data_loaded(db_data, origin='database', persist=False)
+            return
+
+        # Step 2/3: 本地无数据，后台抓取
         def _crawl():
+            crawled = None
             try:
-                crawled = get_latest_models(minimum_rows=100, fallback_to_simulated=False)
-                if len(crawled) >= 100:
-                    self.root.after(0, lambda: self._on_data_loaded(crawled, origin='crawler'))
-                    return
+                crawled = get_latest_models(minimum_rows=self._MIN_CRAWL_ROWS,
+                                            fallback_to_simulated=False)
             except Exception:
-                pass
-            # Step 4: Crawl failed — use simulated
-            fallback = get_simulated_data()
-            self.root.after(0, lambda: self._on_data_loaded(fallback, origin='simulated'))
+                crawled = None
+            if crawled and len(crawled) >= self._MIN_CRAWL_ROWS:
+                self.root.after(0, lambda: self._on_data_loaded(crawled, origin='crawler'))
+            else:
+                fallback = get_simulated_data()
+                self.root.after(0, lambda: self._on_data_loaded(fallback, origin='simulated'))
 
         threading.Thread(target=_crawl, daemon=True).start()
 
-    def _on_data_loaded(self, data, origin='simulated'):
+    def _on_data_loaded(self, data, origin='simulated', persist=True):
         if not data:
             data = get_simulated_data()
             origin = 'simulated'
 
         self.raw_data = data
         self.filtered_data = data
+        self.data_origin = origin
+        self.data_loaded_at = datetime.now()
 
         # Group data by arena slug
         self._arena_data = {}
@@ -648,8 +747,9 @@ class ModernApp:
         # Default model list = current arena
         self.models = self._arena_models.get(self.current_arena, [])
 
-        # Save to database
-        self._save_to_db(data)
+        # 仅在抓取/导入的新数据时写库；读本地无需重复写
+        if persist:
+            self._save_to_db(data)
 
         # Update sidebar stats
         arena_data = self._get_current_arena_data()
@@ -662,35 +762,32 @@ class ModernApp:
         avg_scores = {m: sum(s) / len(s) for m, s in avg_scores.items() if s}
         self._update_stats(arena_data, avg_scores)
 
+        # 更新 header 数据来源状态
+        self._update_header_status()
+
         # Refresh current tab
         self._switch_tab(self.current_tab)
 
+    def _update_header_status(self):
+        if not hasattr(self, '_header_status'):
+            return
+        origin_map = {
+            'database': '本地缓存',
+            'crawler': 'LMArena 实时抓取',
+            'simulated': '内置示例数据',
+            'upload': '导入文件',
+        }
+        origin_text = origin_map.get(self.data_origin, '未知来源')
+        ts = self.data_loaded_at.strftime('%H:%M') if self.data_loaded_at else ''
+        total = len(self.raw_data)
+        self._header_status.config(text=f"数据来源：{origin_text} · {total} 条 · 更新于 {ts}")
+
     def _save_to_db(self, data):
+        """原子地保存完整记录到本地（每条保留 arena/rating/价格等全部字段）。"""
         try:
-            # Clear old data before saving new
-            self.db.clear_all_data()
-            for item in data:
-                model_name = item.get('model', '')
-                category = item.get('category', 'unknown')
-                dimension = item.get('dimension', '')
-                score = item.get('score', 0)
-                source = item.get('source', '')
-
-                # Store extra fields in metadata JSON
-                metadata = {}
-                for key in ('company', 'rating', 'votes', 'license', 'modelUrl', 'arena',
-                            'inputPricePerMillion', 'outputPricePerMillion',
-                            'contextLength'):
-                    if item.get(key) is not None:
-                        metadata[key] = item[key]
-                if not metadata:
-                    metadata = None
-
-                model_id = self.db.insert_or_update_model(
-                    model_name, category, source=source, metadata=metadata)
-                self.db.insert_evaluation(model_id, dimension, score)
+            self.db.save_records(data)
         except Exception:
-            pass  # Silently handle DB errors
+            pass  # 写库失败不影响当前内存数据的分析
 
     def _get_current_arena_data(self):
         return self._arena_data.get(self.current_arena, [])
@@ -717,12 +814,16 @@ class ModernApp:
             top_model = '-'
             top_score = 0
 
-        self._stat_labels['model_count'].config(text=str(len(self.models)))
+        # 更新统计卡
+        if hasattr(self, '_stat_cards'):
+            self._stat_cards['model_count'].set_value(len(self.models))
+            self._stat_cards['avg_score'].set_value(f"{avg_score:.1f}")
+            self._stat_cards['domestic'].set_value(domestic)
+            self._stat_cards['international'].set_value(international)
+
+        # 更新文本指标
         self._stat_labels['eval_count'].config(text=str(len(data)))
-        self._stat_labels['domestic'].config(text=str(domestic))
-        self._stat_labels['international'].config(text=str(international))
-        self._stat_labels['avg_score'].config(text=f"{avg_score:.1f}")
-        self._stat_labels['top_model'].config(text=top_model, wraplength=100, justify='left')
+        self._stat_labels['top_model'].config(text=top_model, wraplength=120, justify='left')
         self._stat_labels['top_score'].config(text=f"{top_score:.1f}")
 
         # Update company rankings in sidebar
@@ -757,6 +858,81 @@ class ModernApp:
 
     # ==================== Ranking Tab ====================
 
+    def _build_rounded_search(self, parent, height, variable, placeholder,
+                              grid_col=0, grid_padx=(0, 12), width_px=None):
+        """苹果风格的胶囊圆角输入框（搜索 / 公司筛选通用）。
+
+        用原生 tk.Entry（非 ttk）+ relief=flat + 无边框 + 白底，融入 canvas
+        圆角背景；圆角半径取 height/2 形成胶囊形；带 placeholder（灰字占位）。
+        返回 entry 控件。
+        """
+        h = height
+        canvas = tk.Canvas(parent, height=h, bg=THEME['bg_secondary'],
+                           highlightthickness=0, bd=0)
+        if width_px:
+            canvas.configure(width=width_px)
+        canvas.grid(row=1, column=grid_col, sticky='ew', padx=grid_padx)
+
+        icon_img = get_icon('search', size=15, color=THEME['text_muted'])
+        icon_photo = ImageTk.PhotoImage(icon_img)
+        # 防止被 GC：挂到实例
+        if not hasattr(self, '_input_photos'):
+            self._input_photos = []
+        self._input_photos.append(icon_photo)
+
+        variable.set(placeholder)
+        entry = tk.Entry(
+            canvas, textvariable=variable,
+            font=(THEME['font_family'], 12),
+            relief='flat', bd=0, highlightthickness=0,
+            bg=THEME['bg_secondary'], fg=THEME['text_muted'],
+            insertbackground=THEME['primary'],
+            disabledbackground=THEME['bg_secondary'])
+
+        radius = h // 2
+        icon_x = 18
+        entry_x = 42
+
+        canvas.create_image(icon_x, h // 2, image=icon_photo, anchor='w')
+        win = canvas.create_window(entry_x, h // 2, window=entry, anchor='w')
+
+        def _draw_bg(focused=False):
+            w = canvas.winfo_width()
+            if w <= 1:
+                return
+            canvas.delete('bg')
+            draw_rounded_rect(
+                canvas, 2, 2, w - 3, h - 3, radius,
+                fill=THEME['bg_secondary'],
+                outline=THEME['border_focus'] if focused else THEME['border'],
+                width=2 if focused else 1, tags='bg')
+            canvas.tag_lower('bg')
+            canvas.itemconfigure(win, width=max(w - entry_x - radius, 40))
+
+        canvas.bind('<Configure>', lambda e: _draw_bg(False))
+
+        def _on_focus_in(_e):
+            if entry.get() == placeholder:
+                entry.delete(0, tk.END)
+                entry.config(fg=THEME['text'])
+            _draw_bg(True)
+
+        def _on_focus_out(_e):
+            if not entry.get().strip():
+                variable.set(placeholder)
+                entry.config(fg=THEME['text_muted'])
+            _draw_bg(False)
+
+        def _on_key(_e):
+            if entry.get() != placeholder:
+                entry.config(fg=THEME['text'])
+
+        entry.bind('<FocusIn>', _on_focus_in)
+        entry.bind('<FocusOut>', _on_focus_out)
+        entry.bind('<KeyRelease>', _on_key)
+        canvas.bind('<Button-1>', lambda e: entry.focus_set())
+        return entry
+
     def _show_ranking(self):
         controls_card = self._create_card(self.content_container, padding=(20, 18))
         controls_card.pack(fill=tk.X, pady=(0, 16))
@@ -776,63 +952,70 @@ class ModernApp:
         )
         self._ranking_status_label.pack(side=tk.RIGHT)
 
+        # 筛选区用 grid：第 0 行全是标签，第 1 行全是控件，保证完美对齐基线
         filter_row = tk.Frame(controls, bg=THEME['bg_secondary'])
-        filter_row.pack(fill=tk.X, pady=(14, 0))
+        filter_row.pack(fill=tk.X, pady=(16, 0))
+        # 搜索列与公司列可伸缩，其余固定
+        filter_row.grid_columnconfigure(0, weight=2)
+        filter_row.grid_columnconfigure(2, weight=1)
+        for col in (1, 3, 4):
+            filter_row.grid_columnconfigure(col, weight=0)
 
-        search_icon_img = get_icon('search', size=16, color=THEME['text_muted'])
-        self._search_photo = ImageTk.PhotoImage(search_icon_img)
-
-        search_container = tk.Frame(filter_row, bg=THEME['bg_secondary'],
-                                    highlightbackground=THEME['border'],
-                                    highlightthickness=1)
-        search_container.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-
-        tk.Label(search_container, image=self._search_photo,
-                 bg=THEME['bg_secondary']).pack(side=tk.LEFT, padx=(12, 4))
-
-        self.search_var = tk.StringVar(value='搜索模型...')
-        search_entry = ttk.Entry(search_container, textvariable=self.search_var,
-                     style='Modern.TEntry', font=(THEME['font_family'], 11))
-        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=10)
-        search_entry.bind('<FocusIn>', lambda e: search_entry.delete(0, tk.END)
-                          if search_entry.get() == '搜索模型...' else None)
-        search_entry.bind('<FocusOut>',
-                          lambda e: self.search_var.set('搜索模型...')
-                          if not search_entry.get().strip() else None)
-
-        companies = ['全部公司'] + sorted({
-            item.get('company', '') for item in self._get_current_arena_data()
-            if item.get('company') and item.get('company') != '未知'
-        })
         categories = ['全部类别', '国内', '国际']
         sort_rules = [
             'Arena Score：高到低',
             '综合均分：高到低',
             '综合均分：低到高',
             'Votes：多到少',
+            '性价比：高到低',
+            '上下文：长到短',
             '代码生成：高到低',
         ]
         top_n_values = ['全部', '10', '25', '50', '100']
 
-        self.company_filter_var = tk.StringVar(value='全部公司')
+        self.search_var = tk.StringVar()
+        self.company_filter_var = tk.StringVar()
         self.category_filter_var = tk.StringVar(value='全部类别')
         self.sort_var = tk.StringVar(value='Arena Score：高到低')
         self.top_n_var = tk.StringVar(value='全部')
+        self._search_placeholder = '搜索模型...'
+        self._company_placeholder = '输入公司名…'
 
-        def _add_filter(label_text, variable, values, width):
-            container = tk.Frame(filter_row, bg=THEME['bg_secondary'])
-            container.pack(side=tk.LEFT, padx=(0, 10))
-            tk.Label(container, text=label_text, bg=THEME['bg_secondary'],
-                     fg=THEME['text_muted'], font=(THEME['font_family'], 10)).pack(anchor='w')
-            combo = ttk.Combobox(container, textvariable=variable, values=values,
-                                 state='readonly', width=width, style='Modern.TCombobox')
-            combo.pack(pady=(6, 0))
-            return combo
+        INPUT_H = THEME['input_height']
 
-        _add_filter('类别', self.category_filter_var, categories, 8)
-        _add_filter('公司', self.company_filter_var, companies, 12)
-        _add_filter('排序', self.sort_var, sort_rules, 14)
-        _add_filter('显示数量', self.top_n_var, top_n_values, 6)
+        def _add_label(text, col, padx):
+            tk.Label(filter_row, text=text, bg=THEME['bg_secondary'],
+                     fg=THEME['text_muted'], font=(THEME['font_family'], 10),
+                     anchor='w').grid(row=0, column=col, sticky='w', padx=padx, pady=(0, 6))
+
+        def _add_combo(variable, values, col, width, padx):
+            # 圆角下拉框，宽度按字符数估算（保持与界面圆角统一）
+            dd = RoundedDropdown(filter_row, variable, values,
+                                 width_px=max(width * 11 + 40, 96), height=INPUT_H)
+            dd.grid(row=1, column=col, sticky='ew', padx=padx)
+            return dd
+
+        # --- 搜索模型（圆角输入框 + 模糊匹配） ---
+        _add_label('搜索模型', 0, (0, 12))
+        self._search_entry = self._build_rounded_search(
+            filter_row, INPUT_H, self.search_var, self._search_placeholder,
+            grid_col=0, grid_padx=(0, 12))
+
+        # --- 类别（下拉） ---
+        _add_label('类别', 1, (0, 12))
+        _add_combo(self.category_filter_var, categories, 1, 9, (0, 12))
+
+        # --- 公司（改为手动输入 + 模糊匹配，与搜索模型相同逻辑） ---
+        _add_label('公司', 2, (0, 12))
+        self._company_entry = self._build_rounded_search(
+            filter_row, INPUT_H, self.company_filter_var, self._company_placeholder,
+            grid_col=2, grid_padx=(0, 12))
+
+        # --- 排序 / 显示数量（下拉） ---
+        _add_label('排序', 3, (0, 12))
+        _add_combo(self.sort_var, sort_rules, 3, 15, (0, 12))
+        _add_label('显示数量', 4, (0, 0))
+        _add_combo(self.top_n_var, top_n_values, 4, 7, (0, 0))
 
         for variable in (self.search_var, self.category_filter_var, self.company_filter_var,
                          self.sort_var, self.top_n_var):
@@ -847,7 +1030,7 @@ class ModernApp:
         table_card.pack(fill=tk.BOTH, expand=True)
         table_frame = table_card.content
 
-        columns = ('rank', 'model', 'company_license', 'score', 'votes', 'price', 'context')
+        columns = ('rank', 'model', 'company_license', 'score', 'votes', 'price', 'context', 'value')
         self.ranking_tree = ttk.Treeview(table_frame, columns=columns,
                                           show='headings', style='Custom.Treeview')
 
@@ -858,14 +1041,21 @@ class ModernApp:
         self.ranking_tree.heading('votes', text='Votes')
         self.ranking_tree.heading('price', text='Price $/M')
         self.ranking_tree.heading('context', text='Context')
+        self.ranking_tree.heading('value', text='性价比')
 
-        self.ranking_tree.column('rank', width=50, anchor='center')
+        self.ranking_tree.column('rank', width=56, anchor='center')
         self.ranking_tree.column('model', width=180, anchor='w')
         self.ranking_tree.column('company_license', width=180, anchor='w')
         self.ranking_tree.column('score', width=70, anchor='center')
-        self.ranking_tree.column('votes', width=70, anchor='center')
-        self.ranking_tree.column('price', width=100, anchor='center')
-        self.ranking_tree.column('context', width=80, anchor='center')
+        self.ranking_tree.column('votes', width=72, anchor='center')
+        self.ranking_tree.column('price', width=104, anchor='center')
+        self.ranking_tree.column('context', width=78, anchor='center')
+        self.ranking_tree.column('value', width=72, anchor='center')
+
+        # 排名前三高亮 tag
+        self.ranking_tree.tag_configure('rank1', foreground='#b8860b')
+        self.ranking_tree.tag_configure('rank2', foreground='#7d8597')
+        self.ranking_tree.tag_configure('rank3', foreground='#a0522d')
 
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
                        style='Modern.Vertical.TScrollbar',
@@ -967,6 +1157,15 @@ class ModernApp:
             extras = model_extras.get(model, {})
             category = extras.get('category', '')
             company = info['company']
+            # 性价比：Arena Score 相对输出价格（价格越低、分越高 → 越高）
+            rating_val = extras.get('rating', 0) or 0
+            out_price = extras.get('outputPrice')
+            if rating_val and out_price is not None and out_price > 0:
+                value_ratio = rating_val / out_price
+            elif rating_val and out_price == 0:
+                value_ratio = float('inf')  # 免费且有评分 → 极致性价比
+            else:
+                value_ratio = None
             rows.append({
                 'rank': rank_map.get(model, 0),
                 'model': model,
@@ -982,18 +1181,21 @@ class ModernApp:
                 'outputPrice': extras.get('outputPrice'),
                 'contextLength': extras.get('contextLength'),
                 'modelUrl': extras.get('modelUrl', ''),
+                'value_ratio': value_ratio,
                 'dimensions': len(dimension_scores),
                 'code_score': dimension_scores.get('代码生成', 0),
                 'dimension_scores': dimension_scores,
             })
 
         search = self.search_var.get().strip() if hasattr(self, 'search_var') else ''
-        if search and search != '搜索模型...':
+        if search and search != getattr(self, '_search_placeholder', '搜索模型...'):
             rows = [row for row in rows if search.lower() in row['model'].lower()]
 
-        company_filter = self.company_filter_var.get() if hasattr(self, 'company_filter_var') else '全部公司'
-        if company_filter and company_filter != '全部公司':
-            rows = [row for row in rows if row['company'] == company_filter]
+        # 公司：手动输入 + 模糊匹配（与搜索模型相同逻辑，忽略占位符）
+        company_filter = self.company_filter_var.get().strip() if hasattr(self, 'company_filter_var') else ''
+        if company_filter and company_filter != getattr(self, '_company_placeholder', ''):
+            rows = [row for row in rows
+                    if company_filter.lower() in (row.get('company') or '').lower()]
 
         category_filter = self.category_filter_var.get() if hasattr(self, 'category_filter_var') else '全部类别'
         if category_filter == '国内':
@@ -1008,6 +1210,11 @@ class ModernApp:
             rows.sort(key=lambda row: row['avg'])
         elif sort_rule == 'Votes：多到少':
             rows.sort(key=lambda row: row.get('votes', 0) or 0, reverse=True)
+        elif sort_rule == '性价比：高到低':
+            rows.sort(key=lambda row: (row.get('value_ratio') if row.get('value_ratio') is not None else -1),
+                      reverse=True)
+        elif sort_rule == '上下文：长到短':
+            rows.sort(key=lambda row: row.get('contextLength') or 0, reverse=True)
         elif sort_rule == '代码生成：高到低':
             rows.sort(key=lambda row: row['code_score'], reverse=True)
         else:
@@ -1048,9 +1255,29 @@ class ModernApp:
                     context_str = f"{cl // 1024}K"
                 else:
                     context_str = str(cl)
+            value_str = '-'
+            vr = row.get('value_ratio')
+            if vr == float('inf'):
+                value_str = '免费'
+            elif vr is not None:
+                value_str = f"{vr:.0f}"
+
+            rank = row['rank']
+            tags = ()
+            if rank == 1:
+                tags = ('rank1',)
+            elif rank == 2:
+                tags = ('rank2',)
+            elif rank == 3:
+                tags = ('rank3',)
+            medal = {1: '🥇', 2: '🥈', 3: '🥉'}.get(rank, '')
+            rank_label = f"{medal} #{rank}" if medal else f"#{rank}"
+
             item_id = self.ranking_tree.insert('', tk.END,
-                                               values=(f"#{row['rank']}", row['model'], company_license,
-                                                       score_str, votes_str, price_str, context_str))
+                                               values=(rank_label, row['model'], company_license,
+                                                       score_str, votes_str, price_str,
+                                                       context_str, value_str),
+                                               tags=tags)
             self._ranking_row_map[item_id] = row
 
         if hasattr(self, '_ranking_status_label'):
@@ -1141,9 +1368,19 @@ class ModernApp:
                 ctx_text = f"{cl} tokens"
         _info_item(self._detail_right, 'Context', ctx_text, 3)
 
+        vr = row.get('value_ratio')
+        if vr == float('inf'):
+            value_text = '免费 · 极致性价比'
+        elif vr is not None:
+            value_text = f"{vr:.0f} (分/美元)"
+        else:
+            value_text = '-'
+        _info_item(self._detail_right, '性价比', value_text, 4,
+                   fg=THEME['success'] if vr else None)
+
         url_text = row.get('modelUrl', '') or ''
         if url_text:
-            _info_item(self._detail_right, 'Link', url_text, 4, fg=THEME['primary'])
+            _info_item(self._detail_right, 'Link', url_text, 5, fg=THEME['primary'])
 
         # Dimension breakdown
         ordered_dims = sorted(row['dimension_scores'].items(), key=lambda item: item[1], reverse=True)
@@ -1197,18 +1434,22 @@ class ModernApp:
 
         self.model1_var = tk.StringVar()
         self.model2_var = tk.StringVar()
+        # 选择模型后自动刷新对比（替代原 ComboboxSelected 事件）
+        self.model1_var.trace_add('write', lambda *a: self._maybe_refresh_compare())
+        self.model2_var.trace_add('write', lambda *a: self._maybe_refresh_compare())
+
+        # 默认选中分数最高的两个模型
+        if sorted_models:
+            self.model1_var.set(sorted_models[0])
+        if len(sorted_models) > 1:
+            self.model2_var.set(sorted_models[1])
 
         # Model A column
         col_a = tk.Frame(selector_container, bg=THEME['bg_secondary'])
         col_a.grid(row=0, column=0, sticky='ew', padx=(0, 6))
         tk.Label(col_a, text="模型 A", bg=THEME['bg_secondary'],
                  fg=THEME['text_muted'], font=(THEME['font_family'], 10)).pack(anchor='w', pady=(0, 4))
-        cb1 = ttk.Combobox(col_a, textvariable=self.model1_var,
-                   values=sorted_models, state='readonly', width=30,
-                   style='Modern.TCombobox')
-        cb1.pack(fill=tk.X)
-        if sorted_models:
-            cb1.current(0)
+        RoundedDropdown(col_a, self.model1_var, sorted_models, width_px=320).pack(fill=tk.X)
 
         # VS label centered
         vs_frame = tk.Frame(selector_container, bg=THEME['bg_secondary'])
@@ -1221,12 +1462,7 @@ class ModernApp:
         col_b.grid(row=0, column=2, sticky='ew', padx=(6, 0))
         tk.Label(col_b, text="模型 B", bg=THEME['bg_secondary'],
                  fg=THEME['text_muted'], font=(THEME['font_family'], 10)).pack(anchor='w', pady=(0, 4))
-        cb2 = ttk.Combobox(col_b, textvariable=self.model2_var,
-                   values=sorted_models, state='readonly', width=30,
-                   style='Modern.TCombobox')
-        cb2.pack(fill=tk.X)
-        if len(sorted_models) > 1:
-            cb2.current(1)
+        RoundedDropdown(col_b, self.model2_var, sorted_models, width_px=320).pack(fill=tk.X)
 
         # Action buttons row
         action_row = tk.Frame(inner, bg=THEME['bg_secondary'])
@@ -1296,19 +1532,39 @@ class ModernApp:
         if hasattr(self, 'compare_result') and self.compare_result.winfo_exists():
             self._do_compare()
 
-    def _do_compare(self):
+    def _clear_compare_result(self, hint=None):
+        """清空对比结果区，可选显示一句居中提示。"""
+        if not hasattr(self, 'compare_result') or not self.compare_result.winfo_exists():
+            return
+        for widget in self.compare_result.winfo_children():
+            widget.destroy()
+        if hint:
+            tk.Label(self.compare_result, text=hint, bg=THEME['bg'],
+                     fg=THEME['text_muted'],
+                     font=(THEME['font_family'], 12)).pack(expand=True, pady=60)
+
+    def _do_compare(self, silent=False):
+        """执行对比。silent=True 时（自动刷新场景）不弹框，仅清空结果区。"""
         m1 = self.model1_var.get()
         m2 = self.model2_var.get()
         selected_dimensions = self._get_selected_compare_dimensions()
 
+        # 校验失败：手动触发时提示，自动触发时静默清空
         if not m1 or not m2:
-            messagebox.showwarning("提示", "请选择两个模型")
+            if silent:
+                self._clear_compare_result()
+            else:
+                messagebox.showwarning("提示", "请选择两个模型")
             return
         if m1 == m2:
-            messagebox.showwarning("提示", "请选择不同的模型进行对比")
+            if silent:
+                self._clear_compare_result('请选择两个不同的模型进行对比')
+            else:
+                messagebox.showwarning("提示", "请选择不同的模型进行对比")
             return
         if not selected_dimensions:
-            messagebox.showwarning("提示", "请至少选择一个对比维度")
+            # 什么维度都没选 —— 就真的不对比，清空结果区，绝不报错
+            self._clear_compare_result('未选择任何对比维度')
             return
 
         if self._compare_rendering or not hasattr(self, 'compare_result') or not self.compare_result.winfo_exists():
@@ -1327,7 +1583,10 @@ class ModernApp:
                        if d['model'] == m2 and d['dimension'] in selected_dimensions}
 
             if not m1_data or not m2_data:
-                messagebox.showwarning("提示", "模型数据不足")
+                if silent:
+                    self._clear_compare_result('所选维度下模型数据不足')
+                else:
+                    messagebox.showwarning("提示", "模型数据不足")
                 return
 
             # Two-column layout: chart left, table right
@@ -1520,8 +1779,8 @@ class ModernApp:
         return [dimension for dimension, var in self._compare_dim_vars.items() if var.get()]
 
     def _maybe_refresh_compare(self):
-        if hasattr(self, 'compare_result') and self.compare_result.winfo_exists() and self.model1_var.get() and self.model2_var.get():
-            self._do_compare()
+        if hasattr(self, 'compare_result') and self.compare_result.winfo_exists():
+            self._do_compare(silent=True)
 
     def _swap_compare_models(self):
         model1 = self.model1_var.get()
@@ -1597,6 +1856,13 @@ class ModernApp:
         tk.Label(info_frame, text="旗舰模型一览", bg=THEME['bg_secondary'],
                  fg=THEME['text'], font=(THEME['font_family'], 12, 'bold')).pack(anchor='w', pady=(0, 12))
 
+        # 计算全局维度区间，用于条长归一化（让条长真实反映强弱差异）
+        all_dim_scores = [v for _, info in companies for v in info['scores'].values()]
+        g_min = min(all_dim_scores) if all_dim_scores else 0
+        g_max = max(all_dim_scores) if all_dim_scores else 100
+        lo, hi = get_score_range([g_min, g_max], padding_ratio=0.05, minimum_padding=1.0)
+        span = max(hi - lo, 1e-6)
+
         colors = THEME['chart_colors']
         for i, (company, info) in enumerate(companies):
             color = colors[i % len(colors)]
@@ -1604,45 +1870,64 @@ class ModernApp:
             scores = info['scores']
             avg = sum(scores.values()) / len(scores) if scores else 0
 
-            # Company + model row
-            row_frame = tk.Frame(info_frame, bg=THEME['bg_secondary'])
-            row_frame.pack(fill=tk.X, pady=(0, 10))
-
-            # Color indicator dot
-            dot_canvas = tk.Canvas(row_frame, width=10, height=10,
+            # 标题行：色点 + 公司·模型 + 均分
+            head = tk.Frame(info_frame, bg=THEME['bg_secondary'])
+            head.pack(fill=tk.X, pady=(0, 6))
+            dot_canvas = tk.Canvas(head, width=10, height=10,
                                    bg=THEME['bg_secondary'], highlightthickness=0)
-            dot_canvas.pack(side=tk.LEFT, padx=(0, 8), pady=(4, 0))
+            dot_canvas.pack(side=tk.LEFT, padx=(0, 8), pady=(5, 0))
             dot_canvas.create_oval(1, 1, 9, 9, fill=color, outline='')
 
-            text_col = tk.Frame(row_frame, bg=THEME['bg_secondary'])
+            text_col = tk.Frame(head, bg=THEME['bg_secondary'])
             text_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
             company_label = f"{company} · {model}" if company != model else model
             tk.Label(text_col, text=company_label, bg=THEME['bg_secondary'],
                      fg=THEME['text'], font=(THEME['font_family'], 10, 'bold'),
                      anchor='w', wraplength=250, justify='left').pack(anchor='w')
-            tk.Label(text_col, text=f"均分 {avg:.1f}  ·  {len(scores)} 维度",
+            tk.Label(text_col, text=f"均分 {avg:.1f}  ·  {len(scores)} 个维度",
                      bg=THEME['bg_secondary'], fg=THEME['text_muted'],
                      font=(THEME['font_family'], 9), anchor='w').pack(anchor='w')
 
-            # Mini dimension bar
-            bar_frame = tk.Frame(text_col, bg=THEME['bg_secondary'])
-            bar_frame.pack(fill=tk.X, pady=(4, 0))
-
+            # 全维度水平进度条：维度名 + 条 + 分数（条长按数据区间归一化）
             ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            for dim_name, dim_score in ordered[:4]:
-                pct = min(100, max(0, dim_score))
-                bar_container = tk.Frame(bar_frame, bg=THEME['border_light'], height=6, width=40)
-                bar_container.pack(side=tk.LEFT, padx=(0, 6))
-                bar_container.pack_propagate(False)
-                fill_width = max(1, int(40 * pct / 100))
-                bar_fill = tk.Frame(bar_container, bg=color, width=fill_width, height=6)
-                bar_fill.place(x=0, y=0, relheight=1.0)
+            row_h = 20
+            bars_canvas = tk.Canvas(text_col, height=row_h * len(ordered) + 4,
+                                    bg=THEME['bg_secondary'], highlightthickness=0, bd=0)
+            bars_canvas.pack(fill=tk.X, pady=(6, 0))
 
-            # Separator (except last)
+            def _draw_bars(cv=bars_canvas, ordered=ordered, color=color):
+                cv.delete('all')
+                w = cv.winfo_width()
+                if w <= 1:
+                    return
+                name_w = 64       # 维度名宽度
+                score_w = 34      # 分数宽度
+                track_x0 = name_w
+                track_x1 = w - score_w
+                track_w = max(track_x1 - track_x0, 10)
+                for r, (dim_name, dim_score) in enumerate(ordered):
+                    cy = r * row_h + row_h // 2 + 2
+                    cv.create_text(0, cy, text=dim_name, anchor='w',
+                                   fill=THEME['text_secondary'],
+                                   font=(THEME['font_family'], 9))
+                    # 轨道
+                    draw_rounded_rect(cv, track_x0, cy - 4, track_x1, cy + 4, 4,
+                                      fill=THEME['border_light'], outline='')
+                    # 填充
+                    ratio = max(0.0, min(1.0, (dim_score - lo) / span))
+                    fill_x1 = track_x0 + max(8, int(track_w * ratio))
+                    draw_rounded_rect(cv, track_x0, cy - 4, fill_x1, cy + 4, 4,
+                                      fill=color, outline='')
+                    cv.create_text(w, cy, text=f"{dim_score:.1f}", anchor='e',
+                                   fill=THEME['text'],
+                                   font=(THEME['font_family'], 9, 'bold'))
+
+            bars_canvas.bind('<Configure>', lambda e, fn=_draw_bars: fn())
+
+            # 分隔线
             if i < len(companies) - 1:
                 sep = tk.Frame(info_frame, bg=THEME['border_light'], height=1)
-                sep.pack(fill=tk.X, pady=(0, 10))
+                sep.pack(fill=tk.X, pady=(10, 10))
 
     # ==================== Heatmap Tab ====================
 
@@ -1668,14 +1953,14 @@ class ModernApp:
         if not current_dims:
             current_dims = EVALUATION_DIMENSIONS
 
-        # Build score matrix once
+        # Build score matrix once（用字典查找，O(N) 替代三重循环）
+        score_lookup = {}
+        for d in arena_data:
+            score_lookup[(d.get('model'), d.get('dimension'))] = d.get('score', 0)
         matrix = np.zeros((len(sorted_models), len(current_dims)))
         for i, model in enumerate(sorted_models):
             for j, dim in enumerate(current_dims):
-                for d in arena_data:
-                    if d.get('model') == model and d.get('dimension') == dim:
-                        matrix[i, j] = d.get('score', 0)
-                        break
+                matrix[i, j] = score_lookup.get((model, dim), 0)
 
         companies = self._get_top_company_flagships(limit=5)
 
@@ -1729,45 +2014,45 @@ class ModernApp:
             grid_frame.grid_rowconfigure(1, weight=1)
             grid_frame.grid_rowconfigure(2, weight=1)
 
-            # Chart 1: 能力热力图
-            c1 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c1.grid(row=0, column=0, sticky='nsew', padx=(0, 8), pady=(0, 8))
-            self._draw_heatmap_chart(c1.content, sorted_models, matrix, current_dims)
+            # 6 张图卡片骨架（先建好布局，绘制延迟以避免一次性阻塞 UI）
+            positions = [
+                (0, 0, (0, 8), (0, 8)), (0, 1, (8, 0), (0, 8)),
+                (1, 0, (0, 8), (8, 0)), (1, 1, (8, 0), (8, 0)),
+                (2, 0, (0, 8), (8, 0)), (2, 1, (8, 0), (8, 0)),
+            ]
+            cards = []
+            for (r, col, px, py) in positions:
+                card = self._create_card(grid_frame, padding=(0, 0), min_height=340)
+                card.grid(row=r, column=col, sticky='nsew', padx=px, pady=py)
+                cards.append(card)
 
-            # Chart 2: 置信区间图
-            c2 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c2.grid(row=0, column=1, sticky='nsew', padx=(8, 0), pady=(0, 8))
-            self._draw_confidence_chart(c2.content, sorted_models, avg_scores)
+            draw_funcs = [
+                lambda p: self._draw_heatmap_chart(p, sorted_models, matrix, current_dims),
+                lambda p: self._draw_confidence_chart(p, sorted_models, avg_scores),
+                lambda p: self._draw_price_rating_scatter(p),
+                lambda p: self._draw_ranking_bar_chart(p, sorted_models, matrix, current_dims),
+                lambda p: self._draw_license_comparison(p, current_dims),
+                lambda p: self._draw_votes_chart(p),
+            ]
 
-            # Chart 3: 价格-评分散点图
-            c3 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c3.grid(row=1, column=0, sticky='nsew', padx=(0, 8), pady=(8, 0))
-            self._draw_price_rating_scatter(c3.content)
+            def _render_one(i):
+                if i >= len(cards):
+                    return
+                card = cards[i]
+                if not card.content.winfo_exists() or self.current_tab != 'heatmap':
+                    return
+                draw_funcs[i](card.content)
+                idx = i + 1
+                # 绘制完成后绑定点击放大
+                for w in (card.frame, card.canvas, card.content):
+                    w.bind('<Button-1>', lambda e, k=idx: self._heatmap_zoom_in(k))
+                self._bind_click_recursive(card.content, lambda e, k=idx: self._heatmap_zoom_in(k))
+                card.frame.bind('<Enter>', lambda e, c=card: c.frame.configure(cursor='hand2'))
+                card.frame.bind('<Leave>', lambda e, c=card: c.frame.configure(cursor=''))
+                # 渲染下一张
+                self.root.after(10, lambda: _render_one(i + 1))
 
-            # Chart 4: 排名分布图
-            c4 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c4.grid(row=1, column=1, sticky='nsew', padx=(8, 0), pady=(8, 0))
-            self._draw_ranking_bar_chart(c4.content, sorted_models, matrix, current_dims)
-
-            # Chart 5: 开源 vs 闭源对比
-            c5 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c5.grid(row=2, column=0, sticky='nsew', padx=(0, 8), pady=(8, 0))
-            self._draw_license_comparison(c5.content, current_dims)
-
-            # Chart 6: 投票热度图
-            c6 = self._create_card(grid_frame, padding=(0, 0), min_height=340)
-            c6.grid(row=2, column=1, sticky='nsew', padx=(8, 0), pady=(8, 0))
-            self._draw_votes_chart(c6.content)
-
-            # Click to zoom in
-            for idx, card in enumerate([c1, c2, c3, c4, c5, c6], start=1):
-                card.frame.bind('<Button-1>', lambda e, i=idx: self._heatmap_zoom_in(i))
-                card.canvas.bind('<Button-1>', lambda e, i=idx: self._heatmap_zoom_in(i))
-                card.content.bind('<Button-1>', lambda e, i=idx: self._heatmap_zoom_in(i))
-                self._bind_click_recursive(card.content, lambda e, i=idx: self._heatmap_zoom_in(i))
-                # Show hand cursor on hover
-                card.frame.bind('<Enter>', lambda e: card.frame.configure(cursor='hand2'))
-                card.frame.bind('<Leave>', lambda e: card.frame.configure(cursor=''))
+            self.root.after_idle(lambda: _render_one(0))
 
     def _heatmap_zoom_in(self, chart_index):
         self._heatmap_zoom = chart_index
@@ -2280,17 +2565,41 @@ class ModernApp:
     # ==================== Button callbacks ====================
 
     def _refresh_data(self):
-        """Force refresh: crawl fresh data from the web."""
+        """点击刷新：主动抓取最新数据。
+
+        - 抓取成功 → 更新并写库，Toast 成功提示。
+        - 抓取失败 → 保留当前本地分析不变，Toast 错误提示。
+        """
+        if self._is_loading:
+            return
+        self._is_loading = True
+        if hasattr(self, '_toast'):
+            self._toast.show('正在抓取最新榜单数据…', type_='info', duration=8000)
+
         def _crawl():
+            crawled = None
+            err = None
             try:
-                crawled = get_latest_models(minimum_rows=100, fallback_to_simulated=False)
-                if len(crawled) >= 100:
-                    self.root.after(0, lambda: self._on_data_loaded(crawled, origin='crawler'))
-                    return
-            except Exception:
-                pass
-            fallback = get_simulated_data()
-            self.root.after(0, lambda: self._on_data_loaded(fallback, origin='simulated'))
+                crawled = get_latest_models(minimum_rows=self._MIN_CRAWL_ROWS,
+                                            fallback_to_simulated=False)
+            except Exception as e:
+                err = e
+                crawled = None
+
+            def _apply():
+                self._is_loading = False
+                if crawled and len(crawled) >= self._MIN_CRAWL_ROWS:
+                    self._on_data_loaded(crawled, origin='crawler', persist=True)
+                    if hasattr(self, '_toast'):
+                        self._toast.show(f'刷新成功 · 已更新 {len(crawled)} 条数据',
+                                         type_='success', duration=3000)
+                else:
+                    # 失败：保留本地数据分析不变
+                    if hasattr(self, '_toast'):
+                        self._toast.show('抓取失败，已保留本地数据分析',
+                                         type_='error', duration=3500)
+            self.root.after(0, _apply)
+
         threading.Thread(target=_crawl, daemon=True).start()
 
     def _upload_file(self):
@@ -2302,6 +2611,12 @@ class ModernApp:
             messagebox.showerror("错误", f"文件上传失败: {e}")
 
     def _export_data(self):
+        # 导出当前选中领域的数据；为空则提示
+        export_data = self._get_current_arena_data() or self.raw_data
+        if not export_data:
+            if hasattr(self, '_toast'):
+                self._toast.show('暂无可导出的数据', type_='warning')
+            return
         try:
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".csv",
@@ -2309,12 +2624,14 @@ class ModernApp:
             )
             if file_path:
                 if file_path.endswith('.json'):
-                    self.file_handler.export_to_json(self.filtered_data, file_path)
+                    self.file_handler.export_to_json(export_data, file_path)
                 else:
-                    self.file_handler.export_to_csv(self.filtered_data, file_path)
-                messagebox.showinfo("成功", f"数据已导出: {file_path}")
+                    self.file_handler.export_to_csv(export_data, file_path)
+                if hasattr(self, '_toast'):
+                    self._toast.show(f'已导出 {len(export_data)} 条数据', type_='success')
         except Exception as e:
-            messagebox.showerror("错误", f"数据导出失败: {e}")
+            if hasattr(self, '_toast'):
+                self._toast.show(f'导出失败：{e}', type_='error')
 
 
 def main():
